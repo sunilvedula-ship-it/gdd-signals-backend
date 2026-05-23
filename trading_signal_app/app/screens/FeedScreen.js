@@ -107,7 +107,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0a0e17',
     justifyContent: 'center',
-    align-items: 'center',
+    alignItems: 'center',
   },
   card: {
     backgroundColor: 'rgba(255, 255, 255, 0.03)',
@@ -130,7 +130,7 @@ const styles = StyleSheet.create({
   cardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    align-items: 'center',
+    alignItems: 'center',
     marginBottom: 8,
   },
   symbol: {
@@ -160,7 +160,7 @@ const styles = StyleSheet.create({
   cardBody: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    align-items: 'flex-end',
+    alignItems: 'flex-end',
   },
   priceLabel: {
     fontSize: 9,

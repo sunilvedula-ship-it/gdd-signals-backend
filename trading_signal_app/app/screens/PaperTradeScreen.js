@@ -40,6 +40,9 @@ export default function PaperTradeScreen() {
     const isLong = item.direction === 'LONG';
     const isClosed = item.status === 'CLOSED';
     const isProfit = item.pnl > 0;
+    const isLoss = item.pnl < 0;
+    
+    const pnlTextColor = isProfit ? styles.textProfit : (isLoss ? styles.textLoss : styles.textNeutral);
     
     return (
       <View style={styles.card}>
@@ -51,13 +54,19 @@ export default function PaperTradeScreen() {
             <Text style={styles.symbol}>{item.symbol}</Text>
             <Text style={styles.qty}>{item.qty} Qty</Text>
           </View>
-          <Text style={[styles.pnl, isClosed ? (isProfit ? styles.textProfit : styles.textLoss) : styles.textOpen]}>
-            {isClosed ? `₹${item.pnl.toLocaleString('en-IN', {minimumFractionDigits: 2})}` : 'OPEN'}
+          <Text style={[styles.pnl, pnlTextColor]}>
+            {isClosed 
+              ? `₹${item.pnl.toLocaleString('en-IN', {minimumFractionDigits: 2})}` 
+              : `₹${item.pnl.toLocaleString('en-IN', {minimumFractionDigits: 2})} (OPEN)`
+            }
           </Text>
         </View>
         
         <View style={styles.cardDetails}>
-          <Text style={styles.detailText}>Entry: ₹{item.entry_price.toLocaleString('en-IN')}</Text>
+          <Text style={styles.detailText}>
+            Entry: ₹{item.entry_price.toLocaleString('en-IN')}
+            {!isClosed && item.current_price && ` | LTP: ₹${item.current_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}`}
+          </Text>
           {isClosed ? (
             <Text style={styles.detailText}>Exit: ₹{item.exit_price.toLocaleString('en-IN')}</Text>
           ) : (
@@ -126,7 +135,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0a0e17',
     justifyContent: 'center',
-    align-items: 'center',
+    alignItems: 'center',
   },
   statsContainer: {
     flexDirection: 'row',
@@ -170,7 +179,7 @@ const styles = StyleSheet.create({
   cardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    align-items: 'center',
+    alignItems: 'center',
     marginBottom: 8,
   },
   leftHeader: {
@@ -215,7 +224,7 @@ const styles = StyleSheet.create({
   cardDetails: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    align-items: 'center',
+    alignItems: 'center',
     borderTopWidth: 1,
     borderTopColor: 'rgba(255, 255, 255, 0.04)',
     paddingTop: 8,

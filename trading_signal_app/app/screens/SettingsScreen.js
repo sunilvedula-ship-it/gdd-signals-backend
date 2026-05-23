@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { StyleSheet, View, Text, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, Linking } from 'react-native';
 import { BACKEND_URL } from '../config';
+import { supabase } from '../supabase';
 
 
 export default function SettingsScreen() {
@@ -8,6 +9,14 @@ export default function SettingsScreen() {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [loading, setLoading] = useState(true);
+
+  const handleLogout = async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (error) {
+      console.error("Error signing out:", error);
+    }
+  };
 
   const fetchCredentials = async () => {
     try {
@@ -144,9 +153,17 @@ export default function SettingsScreen() {
           <Text style={styles.stratArrow}>→</Text>
         </TouchableOpacity>
       </View>
+
+      <Text style={styles.sectionTitle}>4. Account Session</Text>
+      <View style={styles.card}>
+        <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
+          <Text style={styles.logoutBtnText}>Log Out of Account</Text>
+        </TouchableOpacity>
+      </View>
     </ScrollView>
   );
 }
+
 
 const styles = StyleSheet.create({
   container: {
@@ -160,7 +177,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0a0e17',
     justifyContent: 'center',
-    align-items: 'center',
+    alignItems: 'center',
   },
   sectionTitle: {
     fontSize: 13,
@@ -266,7 +283,7 @@ const styles = StyleSheet.create({
   stratItem: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    align-items: 'center',
+    alignItems: 'center',
     backgroundColor: 'rgba(0, 0, 0, 0.15)',
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.04)',
@@ -282,6 +299,19 @@ const styles = StyleSheet.create({
   stratArrow: {
     color: '#3b82f6',
     fontSize: 14,
+    fontWeight: 'bold',
+  },
+  logoutBtn: {
+    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+    borderColor: 'rgba(239, 68, 68, 0.25)',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    alignItems: 'center',
+  },
+  logoutBtnText: {
+    color: '#ef4444',
+    fontSize: 12,
     fontWeight: 'bold',
   },
 });

@@ -104,7 +104,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0a0e17',
     justifyContent: 'center',
-    align-items: 'center',
+    alignItems: 'center',
   },
   consentCard: {
     backgroundColor: 'rgba(255, 255, 255, 0.03)',
@@ -120,7 +120,7 @@ const styles = StyleSheet.create({
     borderRadius: 30,
     backgroundColor: 'rgba(245, 158, 11, 0.15)',
     justifyContent: 'center',
-    align-items: 'center',
+    alignItems: 'center',
     marginBottom: 16,
   },
   icon: {

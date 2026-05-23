@@ -368,6 +368,17 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "source_name": s.source_name
     } for s in signals]
 
+def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
+    # Find the latest signal for this symbol
+    latest_signal = db.query(Signal).filter(Signal.symbol == symbol).order_by(Signal.timestamp.desc()).first()
+    price = latest_signal.price if latest_signal else entry_price
+    
+    # To make it dynamic and simulate real-time ticks, we apply a small random fluctuation (e.g. up to 0.15% change)
+    import random
+    fluctuation = random.uniform(-0.0015, 0.0015)
+    simulated_price = price * (1 + fluctuation)
+    return round(simulated_price, 2)
+
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db)):
     positions = db.query(Position).order_by(Position.entry_time.desc()).all()
@@ -376,26 +387,56 @@ def get_paper_trades(db: Session = Depends(get_db)):
     closed_positions = [p for p in positions if p.status == "CLOSED"]
     open_positions = [p for p in positions if p.status == "OPEN"]
     
-    total_pnl = sum(p.pnl for p in closed_positions)
+    closed_pnl = sum(p.pnl for p in closed_positions)
+    
+    # Calculate open positions details
+    positions_data = []
+    total_open_pnl = 0.0
+    
+    for p in positions:
+        if p.status == "OPEN":
+            current_price = get_current_price(p.symbol, p.entry_price, db)
+            if p.direction == "LONG":
+                pnl = (current_price - p.entry_price) * p.qty
+            else:
+                pnl = (p.entry_price - current_price) * p.qty
+            total_open_pnl += pnl
+            positions_data.append({
+                "id": p.id,
+                "symbol": p.symbol,
+                "direction": p.direction,
+                "qty": p.qty,
+                "entry_price": p.entry_price,
+                "entry_time": p.entry_time.isoformat(),
+                "exit_price": None,
+                "exit_time": None,
+                "status": p.status,
+                "current_price": current_price,
+                "pnl": round(pnl, 2)
+            })
+        else:
+            positions_data.append({
+                "id": p.id,
+                "symbol": p.symbol,
+                "direction": p.direction,
+                "qty": p.qty,
+                "entry_price": p.entry_price,
+                "entry_time": p.entry_time.isoformat(),
+                "exit_price": p.exit_price,
+                "exit_time": p.exit_time.isoformat() if p.exit_time else None,
+                "status": p.status,
+                "pnl": p.pnl
+            })
+            
+    total_pnl = closed_pnl + total_open_pnl
     total_trades = len(closed_positions)
     winning_trades = sum(1 for p in closed_positions if p.pnl > 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
     
     return {
-        "positions": [{
-            "id": p.id,
-            "symbol": p.symbol,
-            "direction": p.direction,
-            "qty": p.qty,
-            "entry_price": p.entry_price,
-            "entry_time": p.entry_time.isoformat(),
-            "exit_price": p.exit_price,
-            "exit_time": p.exit_time.isoformat() if p.exit_time else None,
-            "status": p.status,
-            "pnl": p.pnl
-        } for p in positions],
+        "positions": positions_data,
         "stats": {
-            "total_pnl": total_pnl,
+            "total_pnl": round(total_pnl, 2),
             "total_trades": total_trades,
             "win_rate": win_rate,
             "open_count": len(open_positions)
@@ -408,12 +449,17 @@ def manual_exit_position(pos_id: int, db: Session = Depends(get_db)):
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
     
-    # We will simulate exit price as entry price or mock some random price movement
-    # For user ease, we let them close at current simulated price. In this API, we just close it.
-    pos.exit_price = pos.entry_price # Default to break even for simplicity or mock it
+    # Exit at the current simulated price
+    exit_price = get_current_price(pos.symbol, pos.entry_price, db)
+    
+    pos.exit_price = exit_price
     pos.exit_time = datetime.utcnow()
     pos.status = "CLOSED"
-    pos.pnl = 0.0 # Closed manually at break-even for mock
+    if pos.direction == "LONG":
+        pos.pnl = round((exit_price - pos.entry_price) * pos.qty, 2)
+    else:
+        pos.pnl = round((pos.entry_price - exit_price) * pos.qty, 2)
+        
     db.commit()
     return {"status": "success", "pnl": pos.pnl}
 

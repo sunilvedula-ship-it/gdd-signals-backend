@@ -270,7 +270,7 @@ function loadPaperTrades() {
                 const pnlClass = pos.pnl > 0 ? "positive" : (pos.pnl < 0 ? "negative" : "");
                 const formattedPnL = isClosed 
                     ? `₹${pos.pnl.toLocaleString('en-IN', {minimumFractionDigits: 2})}` 
-                    : "OPEN";
+                    : `₹${pos.pnl.toLocaleString('en-IN', {minimumFractionDigits: 2})} (OPEN)`;
                 
                 return `
                     <div class="glass-card position-card">
@@ -283,7 +283,7 @@ function loadPaperTrades() {
                             <span class="pos-pnl ${pnlClass}">${formattedPnL}</span>
                         </div>
                         <div class="pos-details">
-                            <div>Entry: ₹${pos.entry_price.toLocaleString('en-IN')}</div>
+                            <div>Entry: ₹${pos.entry_price.toLocaleString('en-IN')}${!isClosed && pos.current_price ? ` | LTP: ₹${pos.current_price.toLocaleString('en-IN', {minimumFractionDigits: 2})}` : ''}</div>
                             ${isClosed 
                                 ? `<div>Exit: ₹${pos.exit_price.toLocaleString('en-IN')}</div>` 
                                 : `<button class="pos-exit-btn" onclick="exitPosition(${pos.id})">Manual Close</button>`
