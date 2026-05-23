@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GuruDevaDatta Trading Signals Simulator</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Premium Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Stylesheet -->
+    <link rel="stylesheet" href="app.css">
+</head>
+<body>
+    <div class="page-container">
+        <!-- Sidebar controls (outside phone frame) -->
+        <div class="control-panel">
+            <div class="panel-header">
+                <i class="fa-solid fa-terminal cmd-icon"></i>
+                <h2>Signal Webhook Simulator</h2>
+            </div>
+            <p class="panel-desc">Simulate alerts coming from TradingView or your Python Scanner and see them reflect in the app instantly.</p>
+            
+            <div class="simulation-group">
+                <label for="sim-symbol">Asset Symbol</label>
+                <select id="sim-symbol">
+                    <option value="BANKNIFTY">Bank Nifty (Lot: 30)</option>
+                    <option value="NIFTY">Nifty (Lot: 65)</option>
+                    <option value="SENSEX">Sensex (Lot: 20)</option>
+                    <option value="CRUDEOIL">Crude Oil (Lot: 100)</option>
+                    <option value="GOLD">MCX Gold (Lot: 100)</option>
+                    <option value="RELIANCE">Reliance Stock (Lot: 250)</option>
+                    <option value="WIPRO">Wipro Stock (Lot: 1500)</option>
+                    <option value="BTCUSD">Bitcoin Crypto (Qty: 1)</option>
+                </select>
+            </div>
+            
+            <div class="simulation-group">
+                <label for="sim-action">Signal Action</label>
+                <select id="sim-action">
+                    <option value="LONG">LONG / BUY (Entry)</option>
+                    <option value="SHORT">SHORT / SELL (Entry)</option>
+                    <option value="EXIT">EXIT (Close Position)</option>
+                </select>
+            </div>
+            
+            <div class="simulation-group">
+                <label for="sim-price">Price</label>
+                <input type="number" id="sim-price" value="23500" step="0.05">
+            </div>
+
+            <div class="simulation-group">
+                <label for="sim-source">Signal Source</label>
+                <select id="sim-source">
+                    <option value="TradingView">TradingView Alert</option>
+                    <option value="Python Scanner">Scanner Script</option>
+                </select>
+            </div>
+            
+            <button id="send-signal-btn" class="pulse-button">
+                <i class="fa-solid fa-paper-plane"></i> Send Webhook Alert
+            </button>
+
+            <div class="log-panel">
+                <h3>Backend Activity Log</h3>
+                <div id="activity-logs">
+                    <div class="log-item info">Waiting for signals...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Smartphone Device Mockup -->
+        <div class="phone-device">
+            <div class="phone-bezel">
+                <div class="phone-speaker"></div>
+                <div class="phone-camera"></div>
+                
+                <div class="phone-screen">
+                    <!-- Status Bar -->
+                    <div class="status-bar">
+                        <div class="time">10:58</div>
+                        <div class="icons">
+                            <i class="fa-solid fa-wifi"></i>
+                            <i class="fa-solid fa-signal"></i>
+                            <i class="fa-solid fa-battery-three-quarters"></i>
+                        </div>
+                    </div>
+
+                    <!-- Screen Content Wrap -->
+                    <div class="screen-content">
+
+                        <!-- 1. LOGIN SCREEN -->
+                        <div id="screen-login" class="app-screen active">
+                            <div class="brand-section">
+                                <div class="app-logo">
+                                    <i class="fa-solid fa-chart-line"></i>
+                                </div>
+                                <h1 class="brand-name">GDD Signals</h1>
+                                <p class="brand-subtitle">Smart Wealth Automated</p>
+                            </div>
+                            
+                            <div class="glass-card login-form">
+                                <h3>Welcome Back</h3>
+                                <p>Enter details to access signal feeds</p>
+                                
+                                <div class="input-container">
+                                    <i class="fa-solid fa-envelope"></i>
+                                    <input type="email" id="login-email" placeholder="Email Address" value="user@example.com">
+                                </div>
+                                <div class="input-container">
+                                    <i class="fa-solid fa-phone"></i>
+                                    <input type="text" id="login-phone" placeholder="Phone Number" value="+919999999999">
+                                </div>
+                                
+                                <button id="login-btn" class="action-btn">Sign In / Register</button>
+                                <div class="trial-tag">Includes 5 working-day free trial</div>
+                            </div>
+                        </div>
+
+                        <!-- 2. SERVICE SELECTION SCREEN -->
+                        <div id="screen-services" class="app-screen">
+                            <div class="screen-header">
+                                <h2>Choose Services</h2>
+                                <p>Select the feeds you want to subscribe to</p>
+                            </div>
+                            
+                            <div class="services-list">
+                                <div class="service-item glass-card active" data-service="investment">
+                                    <div class="service-meta">
+                                        <i class="fa-solid fa-briefcase icon-invest"></i>
+                                        <div>
+                                            <h4>Investment Feeds</h4>
+                                            <p>Long-term holding signals</p>
+                                        </div>
+                                    </div>
+                                    <div class="checkbox-ui checked"></div>
+                                </div>
+                                
+                                <div class="service-item glass-card active" data-service="swing">
+                                    <div class="service-meta">
+                                        <i class="fa-solid fa-arrow-trend-up icon-swing"></i>
+                                        <div>
+                                            <h4>Swing Trading</h4>
+                                            <p>Positional trades (days to weeks)</p>
+                                        </div>
+                                    </div>
+                                    <div class="checkbox-ui checked"></div>
+                                </div>
+                                
+                                <div class="service-item glass-card active" data-service="intraday">
+                                    <div class="service-meta">
+                                        <i class="fa-solid fa-bolt icon-intraday"></i>
+                                        <div>
+                                            <h4>Intraday Feeds</h4>
+                                            <p>Same-day entry and exits</p>
+                                        </div>
+                                    </div>
+                                    <div class="checkbox-ui checked"></div>
+                                </div>
+                            </div>
+                            
+                            <button id="save-services-btn" class="action-btn" style="margin-top: auto; margin-bottom: 20px;">
+                                Get Started
+                            </button>
+                        </div>
+
+                        <!-- 3. MAIN DASHBOARD SHELL -->
+                        <div id="screen-dashboard" class="app-screen">
+                            <!-- App Header -->
+                            <div class="dashboard-header">
+                                <div class="user-info">
+                                    <div class="avatar"><i class="fa-solid fa-user"></i></div>
+                                    <div>
+                                        <span class="welcome-text">Hello, Sunil</span>
+                                        <div class="trial-badge"><i class="fa-solid fa-clock"></i> 5 Days Trial</div>
+                                    </div>
+                                </div>
+                                <div class="notification-bell">
+                                    <i class="fa-regular fa-bell"></i>
+                                    <span class="bell-dot"></span>
+                                </div>
+                            </div>
+
+                            <!-- Tab Views Container -->
+                            <div class="tab-content-container">
+                                
+                                <!-- Tab 1: Signals Feed -->
+                                <div id="tab-feed" class="tab-panel active">
+                                    <div class="section-title">
+                                        <h3>Active Signals Feed</h3>
+                                        <span class="pulse-indicator"><span class="dot"></span> Live</span>
+                                    </div>
+                                    
+                                    <div id="signal-feed-list" class="feed-list">
+                                        <!-- Signals loaded dynamically -->
+                                        <div class="empty-feed">
+                                            <i class="fa-solid fa-wind"></i>
+                                            <p>No trading signals received yet. Trigger one from the simulator controls on the left!</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Tab 2: Paper Trading -->
+                                <div id="tab-paper" class="tab-panel">
+                                    <div class="stats-grid">
+                                        <div class="stat-card glass-card">
+                                            <span>Total P&L</span>
+                                            <h4 id="stat-pnl" class="neutral">₹0.00</h4>
+                                        </div>
+                                        <div class="stat-card glass-card">
+                                            <span>Win Rate</span>
+                                            <h4 id="stat-winrate">0%</h4>
+                                        </div>
+                                        <div class="stat-card glass-card">
+                                            <span>Total Trades</span>
+                                            <h4 id="stat-trades">0</h4>
+                                        </div>
+                                    </div>
+
+                                    <div class="section-title" style="margin-top: 15px;">
+                                        <h3>Paper Trade Positions</h3>
+                                    </div>
+
+                                    <div id="positions-list" class="positions-list">
+                                        <div class="empty-feed">
+                                            <i class="fa-solid fa-folder-open"></i>
+                                            <p>No paper trade records. Entry/exit signals will execute here automatically.</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Tab 3: Daily Consent -->
+                                <div id="tab-consent" class="tab-panel">
+                                    <div class="consent-container glass-card">
+                                        <div class="consent-icon-wrapper">
+                                            <i class="fa-solid fa-shield-halved"></i>
+                                        </div>
+                                        <h3>Daily Compliance Consent</h3>
+                                        <p class="consent-date-banner">Date: <span id="consent-today-date">2026-05-23</span></p>
+                                        
+                                        <div class="consent-scroll-box">
+                                            <h5>Terms & Risk Acknowledgment</h5>
+                                            <p>I hereby authorize the auto-execution of alerts on my broker account for today. I fully acknowledge that:
+                                            1. Financial markets carry significant risk of capital loss.
+                                            2. Past performance is not indicative of future results.
+                                            3. The signals provided are directional indices recommendations and the final strategy selections are deployed at my own discretion.
+                                            4. I am solely responsible for all profit and loss generated.</p>
+                                        </div>
+                                        
+                                        <div id="consent-status-box" class="consent-status alert-warning">
+                                            <i class="fa-solid fa-triangle-exclamation"></i>
+                                            <span>Auto-Trade paused until consent is signed.</span>
+                                        </div>
+
+                                        <button id="sign-consent-btn" class="action-btn btn-success">
+                                            <i class="fa-solid fa-signature"></i> I Consent for Today
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <!-- Tab 4: Auto-Trading / Broker -->
+                                <div id="tab-auto" class="tab-panel">
+                                    <div class="section-title">
+                                        <h3>Tradetron & Broker Links</h3>
+                                    </div>
+
+                                    <!-- Step 1: Broker account -->
+                                    <div class="setup-card glass-card">
+                                        <div class="setup-header">
+                                            <span class="step-num">1</span>
+                                            <h4>Broker Setup</h4>
+                                        </div>
+                                        <p>Don't have a zero-brokerage account? Open an account with Flattrade to start.</p>
+                                        <a href="https://flattrade.in/" target="_blank" class="link-btn">
+                                            <i class="fa-solid fa-user-plus"></i> Open Flattrade Account
+                                        </a>
+                                    </div>
+
+                                    <!-- Step 2: Connect Broker credentials -->
+                                    <div class="setup-card glass-card">
+                                        <div class="setup-header">
+                                            <span class="step-num">2</span>
+                                            <h4>Link Broker API</h4>
+                                        </div>
+                                        <div class="broker-selection">
+                                            <select id="broker-select">
+                                                <option value="flattrade">Flattrade (Default)</option>
+                                                <option value="zerodha">Zerodha Kite</option>
+                                                <option value="delta_exchange">Delta Crypto Exchange</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-container mt-1">
+                                            <i class="fa-solid fa-key"></i>
+                                            <input type="text" id="api-key-input" placeholder="API Key">
+                                        </div>
+                                        <div class="input-container mt-1">
+                                            <i class="fa-solid fa-lock"></i>
+                                            <input type="password" id="api-secret-input" placeholder="API Secret">
+                                        </div>
+                                        <button id="save-broker-btn" class="action-btn btn-small">Save Credentials</button>
+                                        
+                                        <div id="configured-brokers" class="mt-2">
+                                            <!-- Configured list will render here -->
+                                        </div>
+                                    </div>
+
+                                    <!-- Step 3: Tradetron links -->
+                                    <div class="setup-card glass-card">
+                                        <div class="setup-header">
+                                            <span class="step-num">3</span>
+                                            <h4>Tradetron Deployments</h4>
+                                        </div>
+                                        <p>Subscribe to our official Tradetron strategies:</p>
+                                        <div class="strategy-links">
+                                            <a href="https://tradetron.tech/strategy/5985482" target="_blank" class="strat-link-item">
+                                                <span>JGD BNF Options Buying</span>
+                                                <i class="fa-solid fa-chevron-right"></i>
+                                            </a>
+                                            <a href="https://tradetron.tech/strategy/8049757" target="_blank" class="strat-link-item">
+                                                <span>Sensex Options Buying</span>
+                                                <i class="fa-solid fa-chevron-right"></i>
+                                            </a>
+                                            <a href="https://tradetron.tech/strategy/2547331" target="_blank" class="strat-link-item">
+                                                <span>Banknifty Futures Positional</span>
+                                                <i class="fa-solid fa-chevron-right"></i>
+                                            </a>
+                                            <a href="https://tradetron.tech/strategy/2769106" target="_blank" class="strat-link-item">
+                                                <span>Nifty Futures Positional</span>
+                                                <i class="fa-solid fa-chevron-right"></i>
+                                            </a>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Tab 5: Profile & Legal -->
+                                <div id="tab-profile" class="tab-panel">
+                                    <div class="profile-card glass-card">
+                                        <i class="fa-solid fa-circle-user avatar-large"></i>
+                                        <h3 id="profile-name">Sunil Vedula</h3>
+                                        <span id="profile-email">user@example.com</span>
+                                        <span id="profile-phone">+91 99999 99999</span>
+                                    </div>
+
+                                    <div class="setup-card glass-card" style="margin-top: 15px;">
+                                        <h4>Legal Agreements & Policies</h4>
+                                        <div class="legal-links">
+                                            <a href="#" class="legal-item"><i class="fa-solid fa-scale-balanced"></i> Terms of Service</a>
+                                            <a href="#" class="legal-item"><i class="fa-solid fa-user-shield"></i> Privacy Policy</a>
+                                            <a href="#" class="legal-item"><i class="fa-solid fa-triangle-exclamation"></i> Risk Disclosures</a>
+                                        </div>
+                                    </div>
+                                </div>
+
+                            </div>
+
+                            <!-- Bottom Navigation -->
+                            <div class="bottom-nav">
+                                <div class="nav-item active" data-tab="feed">
+                                    <i class="fa-solid fa-square-rss"></i>
+                                    <span>Feed</span>
+                                </div>
+                                <div class="nav-item" data-tab="paper">
+                                    <i class="fa-solid fa-wallet"></i>
+                                    <span>Paper Trade</span>
+                                </div>
+                                <div class="nav-item" data-tab="consent">
+                                    <i class="fa-solid fa-stamp"></i>
+                                    <span>Consent</span>
+                                </div>
+                                <div class="nav-item" data-tab="auto">
+                                    <i class="fa-solid fa-robot"></i>
+                                    <span>Auto-Trade</span>
+                                </div>
+                                <div class="nav-item" data-tab="profile">
+                                    <i class="fa-solid fa-bars"></i>
+                                    <span>More</span>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
+                <div class="phone-home-btn"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Script -->
+    <script src="app.js"></script>
+</body>
+</html>

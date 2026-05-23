@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "GDD Signals",
+    "slug": "gdd-signals",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0a0e17"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.gurudevadatta.signals"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0a0e17"
+      },
+      "package": "com.gurudevadatta.signals"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
