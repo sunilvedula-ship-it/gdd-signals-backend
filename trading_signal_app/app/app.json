@@ -4,13 +4,7 @@
     "slug": "gdd-signals",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0a0e17"
-    },
     "assetBundlePatterns": [
       "**/*"
     ],
@@ -19,14 +13,12 @@
       "bundleIdentifier": "com.gurudevadatta.signals"
     },
     "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0a0e17"
-      },
       "package": "com.gurudevadatta.signals"
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
+    "extra": {
+      "eas": {
+        "projectId": "98a4fd1e-0f9e-489b-a766-d03c508d4a44"
+      }
     }
   }
 }
