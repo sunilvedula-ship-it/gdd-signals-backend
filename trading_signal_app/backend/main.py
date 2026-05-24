@@ -368,12 +368,49 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "source_name": s.source_name
     } for s in signals]
 
+def map_symbol_to_yahoo_ticker(symbol: str) -> str:
+    s_upper = symbol.upper().strip()
+    if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
+        return "BTC-USD"
+    elif s_upper in ["NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY"]:
+        return "^NSEI"
+    elif s_upper in ["BANKNIFTY", "NIFTYBANK", "NSE:BANKNIFTY"]:
+        return "^NSEBANK"
+    
+    # Fallback to other cryptos
+    if s_upper.endswith("USD"):
+        return f"{s_upper[:-3]}-USD"
+    if s_upper.endswith("USDT"):
+        return f"{s_upper[:-4]}-USD"
+        
+    return f"{s_upper}.NS"
+
+def get_live_market_price(symbol: str) -> Optional[float]:
+    import urllib.request
+    import json
+    ticker = map_symbol_to_yahoo_ticker(symbol)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read())
+            price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            return float(price)
+    except Exception as e:
+        print(f"Error fetching live price for {ticker}: {e}")
+        return None
+
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
-    # Find the latest signal for this symbol
+    # Try to fetch actual live price from Yahoo Finance
+    live_price = get_live_market_price(symbol)
+    if live_price is not None:
+        return round(live_price, 2)
+        
+    # Fallback to latest signal price in database
     latest_signal = db.query(Signal).filter(Signal.symbol == symbol).order_by(Signal.timestamp.desc()).first()
     price = latest_signal.price if latest_signal else entry_price
     
-    # To make it dynamic and simulate real-time ticks, we apply a small random fluctuation (e.g. up to 0.15% change)
+    # Fallback simulated tick fluctuation
     import random
     fluctuation = random.uniform(-0.0015, 0.0015)
     simulated_price = price * (1 + fluctuation)
