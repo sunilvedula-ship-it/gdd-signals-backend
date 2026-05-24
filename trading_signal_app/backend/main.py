@@ -273,30 +273,16 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     
     # Execution Logic
     if action_norm in ["BUY", "LONG"]:
-        if open_position:
-            # If already open, close it first at current price (forced rollover/reverse)
-            open_position.exit_price = price_val
-            open_position.exit_time = datetime.utcnow()
-            open_position.status = "CLOSED"
-            if open_position.direction == "LONG":
-                open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
-            else:
-                open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
-            trade_log.append(f"Replaced existing {open_position.direction} position on {symbol_norm}")
-        
-        # Open a new LONG position
-        qty = calculate_trade_qty(symbol_norm)
-        new_pos = Position(
-            symbol=symbol_norm,
-            direction="LONG",
-            qty=qty,
-            entry_price=price_val,
-            status="OPEN"
+        # Check if this signal is an explicit LONG entry
+        # If it's a raw 'buy' and we have an open SHORT position, it serves as a COVER (exit only)
+        # unless it is explicitly 'long' or the user has no open position.
+        is_explicit_long_entry = (
+            str(raw_action).lower() in ["long", "entry_long"] or
+            "LONG" in str(raw_key).upper() or
+            "LONG" in str(raw_dir).upper() or
+            (str(raw_action).lower() == "buy" and not open_position)
         )
-        db.add(new_pos)
-        trade_log.append(f"Opened LONG position for {symbol_norm} (Qty: {qty})")
         
-    elif action_norm in ["SELL", "SHORT"]:
         if open_position:
             # Close existing position
             open_position.exit_price = price_val
@@ -306,20 +292,88 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
             else:
                 open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
-            trade_log.append(f"Replaced existing {open_position.direction} position on {symbol_norm}")
+            trade_log.append(f"Closed existing {open_position.direction} position on {symbol_norm}")
             
-        # Open a new SHORT position
-        qty = calculate_trade_qty(symbol_norm)
-        new_pos = Position(
-            symbol=symbol_norm,
-            direction="SHORT",
-            qty=qty,
-            entry_price=price_val,
-            status="OPEN"
+            # If we had a SHORT position and this is a simple 'buy' (cover) and NOT an explicit long entry,
+            # we do NOT open a new LONG position.
+            if open_position.direction == "SHORT" and not is_explicit_long_entry:
+                trade_log.append(f"Covered SHORT position on {symbol_norm} (flat)")
+            else:
+                # Reversal / Explicit LONG entry: open a new LONG position
+                qty = calculate_trade_qty(symbol_norm)
+                new_pos = Position(
+                    symbol=symbol_norm,
+                    direction="LONG",
+                    qty=qty,
+                    entry_price=price_val,
+                    status="OPEN"
+                )
+                db.add(new_pos)
+                trade_log.append(f"Opened LONG position for {symbol_norm} (Qty: {qty})")
+        else:
+            # No open position, open new LONG
+            qty = calculate_trade_qty(symbol_norm)
+            new_pos = Position(
+                symbol=symbol_norm,
+                direction="LONG",
+                qty=qty,
+                entry_price=price_val,
+                status="OPEN"
+            )
+            db.add(new_pos)
+            trade_log.append(f"Opened LONG position for {symbol_norm} (Qty: {qty})")
+            
+    elif action_norm in ["SELL", "SHORT"]:
+        # Check if this signal is an explicit SHORT entry
+        # If it's a raw 'sell' and we have an open LONG position, it serves as a SELL (exit only)
+        # unless it is explicitly 'short' or the user has no open position.
+        is_explicit_short_entry = (
+            str(raw_action).lower() in ["short", "entry_short"] or
+            "SHORT" in str(raw_key).upper() or
+            "SHORT" in str(raw_dir).upper() or
+            (str(raw_action).lower() == "sell" and not open_position)
         )
-        db.add(new_pos)
-        trade_log.append(f"Opened SHORT position for {symbol_norm} (Qty: {qty})")
         
+        if open_position:
+            # Close existing position
+            open_position.exit_price = price_val
+            open_position.exit_time = datetime.utcnow()
+            open_position.status = "CLOSED"
+            if open_position.direction == "LONG":
+                open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
+            else:
+                open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
+            trade_log.append(f"Closed existing {open_position.direction} position on {symbol_norm}")
+            
+            # If we had a LONG position and this is a simple 'sell' and NOT an explicit short entry,
+            # we do NOT open a new SHORT position.
+            if open_position.direction == "LONG" and not is_explicit_short_entry:
+                trade_log.append(f"Exited LONG position on {symbol_norm} (flat)")
+            else:
+                # Reversal / Explicit SHORT entry: open a new SHORT position
+                qty = calculate_trade_qty(symbol_norm)
+                new_pos = Position(
+                    symbol=symbol_norm,
+                    direction="SHORT",
+                    qty=qty,
+                    entry_price=price_val,
+                    status="OPEN"
+                )
+                db.add(new_pos)
+                trade_log.append(f"Opened SHORT position for {symbol_norm} (Qty: {qty})")
+        else:
+            # No open position, open new SHORT
+            qty = calculate_trade_qty(symbol_norm)
+            new_pos = Position(
+                symbol=symbol_norm,
+                direction="SHORT",
+                qty=qty,
+                entry_price=price_val,
+                status="OPEN"
+            )
+            db.add(new_pos)
+            trade_log.append(f"Opened SHORT position for {symbol_norm} (Qty: {qty})")
+            
     elif action_norm in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE"]:
         if open_position:
             open_position.exit_price = price_val
@@ -368,45 +422,6 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "source_name": s.source_name
     } for s in signals]
 
-def map_symbol_to_google_finance_ticker(symbol: str) -> str:
-    s_upper = symbol.upper().strip()
-    if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
-        return "BTC-USD"
-    elif s_upper in ["NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NIFTY_50"]:
-        return "NIFTY_50:INDEXNSE"
-    elif s_upper in ["BANKNIFTY", "NIFTYBANK", "NSE:BANKNIFTY", "NIFTY_BANK"]:
-        return "NIFTY_BANK:INDEXNSE"
-    elif s_upper in ["SENSEX", "BSESN"]:
-        return "SENSEX:INDEXBOM"
-    
-    # Generic stocks / other tickers fallback
-    if s_upper.endswith(".NS"):
-        return f"{s_upper[:-3]}:INDEXNSE"
-    if s_upper.endswith(".BO"):
-        return f"{s_upper[:-3]}:INDEXBOM"
-        
-    return f"{s_upper}:INDEXNSE"
-
-def get_google_finance_price(symbol: str) -> Optional[float]:
-    import urllib.request
-    import re
-    ticker = map_symbol_to_google_finance_ticker(symbol)
-    url = f"https://www.google.com/finance/quote/{ticker}"
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        with urllib.request.urlopen(req, timeout=5) as response:
-            html = response.read().decode('utf-8')
-            match = re.search(r'<div class="gO24Ff">([^<]+)</div>.*?jsname="Pdsbrc"[^>]*><span>([^<]+)</span>', html, re.DOTALL)
-            if match:
-                price_str = match.group(2)
-                price = float(price_str.replace(',', '').replace('$', '').replace('₹', '').strip())
-                return price
-    except Exception as e:
-        print(f"Error fetching live Google Finance price for {ticker}: {e}")
-    return None
-
 def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     s_upper = symbol.upper().strip()
     if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
@@ -425,13 +440,6 @@ def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     return f"{s_upper}.NS"
 
 def get_live_market_price(symbol: str) -> Optional[float]:
-    # 1. Try Google Finance first
-    gf_price = get_google_finance_price(symbol)
-    if gf_price is not None:
-        print(f"[Live Pricing] Google Finance fetched {symbol}: {gf_price}")
-        return gf_price
-        
-    # 2. Fallback to Yahoo Finance
     import urllib.request
     import json
     ticker = map_symbol_to_yahoo_ticker(symbol)
@@ -441,14 +449,13 @@ def get_live_market_price(symbol: str) -> Optional[float]:
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read())
             price = data['chart']['result'][0]['meta']['regularMarketPrice']
-            print(f"[Live Pricing] Yahoo Finance fallback fetched {symbol}: {price}")
             return float(price)
     except Exception as e:
-        print(f"Error fetching live price for {ticker} from Yahoo Finance: {e}")
+        print(f"Error fetching live price for {ticker}: {e}")
         return None
 
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
-    # Try to fetch actual live price
+    # Try to fetch actual live price from Yahoo Finance
     live_price = get_live_market_price(symbol)
     if live_price is not None:
         return round(live_price, 2)
