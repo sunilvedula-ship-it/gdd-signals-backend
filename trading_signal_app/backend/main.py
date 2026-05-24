@@ -368,6 +368,45 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "source_name": s.source_name
     } for s in signals]
 
+def map_symbol_to_google_finance_ticker(symbol: str) -> str:
+    s_upper = symbol.upper().strip()
+    if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
+        return "BTC-USD"
+    elif s_upper in ["NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NIFTY_50"]:
+        return "NIFTY_50:INDEXNSE"
+    elif s_upper in ["BANKNIFTY", "NIFTYBANK", "NSE:BANKNIFTY", "NIFTY_BANK"]:
+        return "NIFTY_BANK:INDEXNSE"
+    elif s_upper in ["SENSEX", "BSESN"]:
+        return "SENSEX:INDEXBOM"
+    
+    # Generic stocks / other tickers fallback
+    if s_upper.endswith(".NS"):
+        return f"{s_upper[:-3]}:INDEXNSE"
+    if s_upper.endswith(".BO"):
+        return f"{s_upper[:-3]}:INDEXBOM"
+        
+    return f"{s_upper}:INDEXNSE"
+
+def get_google_finance_price(symbol: str) -> Optional[float]:
+    import urllib.request
+    import re
+    ticker = map_symbol_to_google_finance_ticker(symbol)
+    url = f"https://www.google.com/finance/quote/{ticker}"
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode('utf-8')
+            match = re.search(r'<div class="gO24Ff">([^<]+)</div>.*?jsname="Pdsbrc"[^>]*><span>([^<]+)</span>', html, re.DOTALL)
+            if match:
+                price_str = match.group(2)
+                price = float(price_str.replace(',', '').replace('$', '').replace('₹', '').strip())
+                return price
+    except Exception as e:
+        print(f"Error fetching live Google Finance price for {ticker}: {e}")
+    return None
+
 def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     s_upper = symbol.upper().strip()
     if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
@@ -386,6 +425,13 @@ def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     return f"{s_upper}.NS"
 
 def get_live_market_price(symbol: str) -> Optional[float]:
+    # 1. Try Google Finance first
+    gf_price = get_google_finance_price(symbol)
+    if gf_price is not None:
+        print(f"[Live Pricing] Google Finance fetched {symbol}: {gf_price}")
+        return gf_price
+        
+    # 2. Fallback to Yahoo Finance
     import urllib.request
     import json
     ticker = map_symbol_to_yahoo_ticker(symbol)
@@ -395,13 +441,14 @@ def get_live_market_price(symbol: str) -> Optional[float]:
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read())
             price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            print(f"[Live Pricing] Yahoo Finance fallback fetched {symbol}: {price}")
             return float(price)
     except Exception as e:
-        print(f"Error fetching live price for {ticker}: {e}")
+        print(f"Error fetching live price for {ticker} from Yahoo Finance: {e}")
         return None
 
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
-    # Try to fetch actual live price from Yahoo Finance
+    # Try to fetch actual live price
     live_price = get_live_market_price(symbol)
     if live_price is not None:
         return round(live_price, 2)
