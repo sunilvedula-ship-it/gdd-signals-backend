@@ -459,14 +459,110 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "source_name": s.source_name
     } for s in signals]
 
+def get_tradingview_price(symbol: str) -> Optional[float]:
+    s = symbol.upper().strip()
+    
+    # 1. Map to TradingView ticker and scanner market
+    tv_ticker = None
+    market = "global"
+    
+    if s in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
+        tv_ticker = "NSE:NIFTY1!"
+        market = "futures"
+    elif s in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
+        tv_ticker = "NSE:BANKNIFTY1!"
+        market = "futures"
+    elif s in ["SENSEX", "BSX1!", "BSE:BSX1!", "BSE:SENSEX"]:
+        tv_ticker = "BSE:BSX1!"
+        market = "futures"
+    elif s in ["BTCUSD", "BTC", "BTC-USD", "BINANCE:BTCUSD"]:
+        tv_ticker = "BINANCE:BTCUSD"
+        market = "crypto"
+    elif s in ["GOLDM1!", "GOLD", "GOLDM", "MCX:GOLDM1!"]:
+        tv_ticker = "MCX:GOLDM1!"
+        market = "futures"
+    elif s in ["CRUDE", "CRUDEOIL", "MCX:CRUDEOIL1!"]:
+        tv_ticker = "MCX:CRUDEOIL1!"
+        market = "futures"
+        
+    if not tv_ticker:
+        # Fallback mappings
+        if "BTC" in s:
+            tv_ticker = "BINANCE:BTCUSD"
+            market = "crypto"
+        elif "NIFTY" in s:
+            tv_ticker = "NSE:NIFTY1!"
+            market = "futures"
+        elif "BANK" in s:
+            tv_ticker = "NSE:BANKNIFTY1!"
+            market = "futures"
+        elif "GOLD" in s:
+            tv_ticker = "MCX:GOLDM1!"
+            market = "futures"
+        else:
+            tv_ticker = f"NSE:{s}1!" if not ":" in s else s
+            market = "global"
+
+    # Send POST request to TradingView Scanner API
+    url = f"https://scanner.tradingview.com/{market}/scan"
+    payload = {
+        "symbols": {
+            "tickers": [tv_ticker],
+            "query": {"types": []}
+        },
+        "columns": ["close"]
+    }
+    
+    import urllib.request
+    import json
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            data_list = res_data.get("data", [])
+            if data_list:
+                return float(data_list[0]["d"][0])
+    except Exception as e:
+        print(f"Error fetching TradingView price for {tv_ticker} on {market}: {e}")
+    return None
+
+def map_symbol_to_google_ticker(symbol: str) -> Optional[str]:
+    s_upper = symbol.upper().strip()
+    if s_upper in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
+        return "NIFTY_50:INDEXNSE"
+    elif s_upper in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
+        return "NIFTY_BANK:INDEXNSE"
+    elif s_upper in ["SENSEX", "BSX1!", "BSE:BSX1!", "BSE:SENSEX"]:
+        return "SENSEX:INDEXBOM"
+    elif s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
+        return "BTC-USD"
+    return None
+
 def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     s_upper = symbol.upper().strip()
-    if s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
-        return "BTC-USD"
-    elif s_upper in ["NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY"]:
+    if s_upper in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
         return "^NSEI"
-    elif s_upper in ["BANKNIFTY", "NIFTYBANK", "NSE:BANKNIFTY"]:
+    elif s_upper in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
         return "^NSEBANK"
+    elif s_upper in ["SENSEX", "BSX1!", "BSE:BSX1!", "BSE:SENSEX"]:
+        return "^BSESN"
+    elif s_upper in ["BTCUSD", "BTC", "BTC-USD"]:
+        return "BTC-USD"
+    elif "GOLD" in s_upper:
+        return "GOLDBEES.NS"
+    elif "SILVER" in s_upper:
+        return "SILVERBEES.NS"
+    elif "CRUDE" in s_upper:
+        return "CL=F"
     
     # Fallback to other cryptos
     if s_upper.endswith("USD"):
@@ -476,22 +572,68 @@ def map_symbol_to_yahoo_ticker(symbol: str) -> str:
         
     return f"{s_upper}.NS"
 
-def get_live_market_price(symbol: str) -> Optional[float]:
+def get_google_finance_price(ticker: str) -> Optional[float]:
     import urllib.request
-    import json
-    ticker = map_symbol_to_yahoo_ticker(symbol)
+    import re
+    url = f"https://www.google.com/finance/quote/{ticker}"
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode('utf-8')
+            match = re.search(r'<div class="gO24Ff">([^<]+)</div>.*?jsname="Pdsbrc"[^>]*><span>([^<]+)</span>', html, re.DOTALL)
+            if match:
+                price_str = match.group(2).replace(',', '').replace('$', '').replace('₹', '').strip()
+                return float(price_str)
+    except Exception as e:
+        print(f"Error scraping Google Finance for {ticker}: {e}")
+    return None
+
+def get_yahoo_finance_price_data(ticker: str) -> dict:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
     try:
+        import urllib.request
+        import json
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read())
-            price = data['chart']['result'][0]['meta']['regularMarketPrice']
-            return float(price)
+            result = data['chart']['result'][0]
+            price = result['meta']['regularMarketPrice']
+            prev_close = result['meta'].get('previousClose')
+            return {"price": float(price), "previous_close": float(prev_close) if prev_close else None}
     except Exception as e:
-        print(f"Error fetching live price for {ticker}: {e}")
-        return None
+        print(f"Error fetching live price from Yahoo Finance for {ticker}: {e}")
+    return {}
+
+def get_live_market_price_data(symbol: str) -> dict:
+    # 1. Try TradingView first (Primary Source)
+    price = get_tradingview_price(symbol)
+    if price is not None:
+        return {"price": price, "previous_close": None, "source": "TradingView"}
+        
+    # 2. Try Google Finance (Backup Source)
+    g_ticker = map_symbol_to_google_ticker(symbol)
+    if g_ticker:
+        price = get_google_finance_price(g_ticker)
+        if price is not None:
+            return {"price": price, "previous_close": None, "source": "GoogleFinance"}
+            
+    # 3. Fallback to Yahoo Finance
+    y_ticker = map_symbol_to_yahoo_ticker(symbol)
+    y_data = get_yahoo_finance_price_data(y_ticker)
+    if y_data:
+        return {"price": y_data["price"], "previous_close": y_data.get("previous_close"), "source": "YahooFinance"}
+        
+    return {}
+
+def get_live_market_price(symbol: str) -> Optional[float]:
+    res = get_live_market_price_data(symbol)
+    return res.get("price")
 
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
+    s_upper = symbol.upper().strip()
+    
     # 1. Detect if the symbol is an Option contract
     parts = symbol.split()
     is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
@@ -514,11 +656,26 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
         return round(max(1.0, current_premium), 2)
         
     # 2. Standard future/equity/crypto price resolution
-    # Try to fetch actual live price from Yahoo Finance
-    live_price = get_live_market_price(symbol)
-    if live_price is not None:
-        return round(live_price, 2)
+    price_data = get_live_market_price_data(symbol)
+    
+    if price_data:
+        live_price = price_data["price"]
+        source = price_data.get("source")
         
+        if source == "TradingView":
+            return round(live_price, 2)
+            
+        prev_close = price_data.get("previous_close")
+        is_commodity_proxy = s_upper in ["GOLDM1!", "GOLD", "CRUDEOIL", "CRUDE", "SILVER"]
+        
+        if is_commodity_proxy and prev_close and prev_close > 0:
+            # Scale entry price by the proxy ETF/future daily percent change
+            pct_change = (live_price - prev_close) / prev_close
+            scaled_price = entry_price * (1.0 + pct_change)
+            return round(scaled_price, 2)
+        else:
+            return round(live_price, 2)
+            
     # Fallback to latest signal price in database
     latest_signal = db.query(Signal).filter(Signal.symbol == symbol).order_by(Signal.timestamp.desc()).first()
     price = latest_signal.price if latest_signal else entry_price
