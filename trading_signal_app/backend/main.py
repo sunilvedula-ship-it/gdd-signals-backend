@@ -718,6 +718,10 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
     simulated_price = price * (1 + fluctuation)
     return round(simulated_price, 2)
 
+def is_usd_asset(symbol: str) -> bool:
+    s = symbol.upper().strip()
+    return "USD" in s or "USDT" in s or s in ["BTC", "ETH", "SOL", "ADA", "XRP"]
+
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db)):
     positions = db.query(Position).order_by(Position.entry_time.desc()).all()
@@ -726,12 +730,12 @@ def get_paper_trades(db: Session = Depends(get_db)):
     closed_positions = [p for p in positions if p.status == "CLOSED"]
     open_positions = [p for p in positions if p.status == "OPEN"]
     
-    closed_pnl = sum(p.pnl for p in closed_positions)
-    
-    # Calculate open positions details
+    # Calculate open positions details & accumulate PnL separately
     positions_data = []
-    total_open_pnl = 0.0
+    total_pnl_inr = 0.0
+    total_pnl_usd = 0.0
     
+    # Process open positions
     for p in positions:
         if p.status == "OPEN":
             current_price = get_current_price(p.symbol, p.entry_price, db)
@@ -739,7 +743,12 @@ def get_paper_trades(db: Session = Depends(get_db)):
                 pnl = (current_price - p.entry_price) * p.qty
             else:
                 pnl = (p.entry_price - current_price) * p.qty
-            total_open_pnl += pnl
+            
+            if is_usd_asset(p.symbol):
+                total_pnl_usd += pnl
+            else:
+                total_pnl_inr += pnl
+                
             positions_data.append({
                 "id": p.id,
                 "symbol": p.symbol,
@@ -754,6 +763,12 @@ def get_paper_trades(db: Session = Depends(get_db)):
                 "pnl": round(pnl, 2)
             })
         else:
+            pnl = p.pnl
+            if is_usd_asset(p.symbol):
+                total_pnl_usd += pnl
+            else:
+                total_pnl_inr += pnl
+                
             positions_data.append({
                 "id": p.id,
                 "symbol": p.symbol,
@@ -767,7 +782,6 @@ def get_paper_trades(db: Session = Depends(get_db)):
                 "pnl": p.pnl
             })
             
-    total_pnl = closed_pnl + total_open_pnl
     total_trades = len(closed_positions)
     winning_trades = sum(1 for p in closed_positions if p.pnl > 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
@@ -775,7 +789,9 @@ def get_paper_trades(db: Session = Depends(get_db)):
     return {
         "positions": positions_data,
         "stats": {
-            "total_pnl": round(total_pnl, 2),
+            "total_pnl": round(total_pnl_inr, 2), # for backward compatibility
+            "total_pnl_inr": round(total_pnl_inr, 2),
+            "total_pnl_usd": round(total_pnl_usd, 2),
             "total_trades": total_trades,
             "win_rate": win_rate,
             "open_count": len(open_positions)
