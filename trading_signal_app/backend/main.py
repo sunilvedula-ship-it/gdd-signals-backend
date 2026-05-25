@@ -77,7 +77,7 @@ def startup_event():
     if not db.query(User).filter(User.id == 1).first():
         user = User(id=1, email="user@example.com", phone="+919999999999", name="Sunil Vedula")
         # 5 working-days trial setup (mocked as ending 7 days from now to cover weekend)
-        user.trial_end = datetime.now()
+        user.trial_end = get_ist_time() + timedelta(days=7)
         db.add(user)
         db.commit()
     db.close()
@@ -93,9 +93,60 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
+from datetime import timedelta
+
+def get_ist_time() -> datetime:
+    # Indian Standard Time (IST) is UTC + 5:30
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
     return symbol.upper().strip()
+
+def extract_strike_from_symbol(symbol: str) -> Optional[float]:
+    parts = symbol.split()
+    if len(parts) >= 3:
+        try:
+            return float(parts[1])
+        except ValueError:
+            pass
+    return None
+
+def close_position_entry(pos: Position, index_exit_price: float, db: Session) -> float:
+    parts = pos.symbol.split()
+    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    
+    if is_option:
+        opt_type = parts[-1]
+        strike = float(parts[1])
+        price_change = index_exit_price - strike
+        delta = 0.5 if opt_type == "CE" else -0.5
+        exit_price = max(1.0, pos.entry_price + price_change * delta)
+    else:
+        exit_price = index_exit_price
+        
+    pos.exit_price = round(exit_price, 2)
+    pos.exit_time = get_ist_time()
+    pos.status = "CLOSED"
+    
+    if pos.direction == "LONG":
+        pos.pnl = round((pos.exit_price - pos.entry_price) * pos.qty, 2)
+    else:
+        pos.pnl = round((pos.entry_price - pos.exit_price) * pos.qty, 2)
+        
+    return pos.pnl
+
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session) -> Position:
+    new_pos = Position(
+        symbol=symbol,
+        direction=direction,
+        qty=qty,
+        entry_price=entry_price,
+        entry_time=get_ist_time(),
+        status="OPEN"
+    )
+    db.add(new_pos)
+    return new_pos
 
 # Helper to determine qty and lot size based on symbol rules
 def calculate_trade_qty(symbol: str) -> float:
@@ -245,145 +296,131 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     source = payload.get("source") or ("TradingView" if (raw_key or "tradingview" in body_str.lower()) else "Scanner")
     source_name = payload.get("orderId") or payload.get("signal_type") or "Webhook Strategy Alert"
 
-    # Check if daily consent is signed for today
-    today_str = date.today().isoformat()
+    # Check if daily consent is signed for today (based on IST date)
+    ist_now = get_ist_time()
+    today_str = ist_now.date().isoformat()
     consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
     consent_signed = consent is not None and consent.consent_given
     
-    # Save signal in database
+    # Process Paper Trade
+    # Check for open positions on this symbol or its options
+    open_positions = db.query(Position).filter(
+        (Position.symbol == symbol_norm) | (Position.symbol.like(f"{symbol_norm} %")),
+        Position.status == "OPEN"
+    ).all()
+    
+    open_pos_future = next((p for p in open_positions if p.symbol == symbol_norm), None)
+    
+    # Contextual Exit Action Labels (SELL & COVER instead of EXIT)
+    if action_norm == "EXIT" and open_pos_future:
+        if open_pos_future.direction == "LONG":
+            action_norm = "SELL"
+        else:
+            action_norm = "COVER"
+            
+    # Calculate Option details (At-The-Money CE/PE option contract)
+    has_options = symbol_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
+    opt_strike = None
+    opt_symbol = None
+    opt_premium = None
+    opt_type = None
+    
+    if has_options and price_val > 0:
+        step = 50 if symbol_norm == "NIFTY" else 100
+        opt_strike = int(round(price_val / step) * step)
+        
+        if action_norm in ["BUY", "LONG"]:
+            opt_type = "CE"
+            opt_premium = price_val * 0.012 if symbol_norm == "NIFTY" else price_val * 0.015
+        elif action_norm in ["SELL", "SHORT"]:
+            is_explicit_short_entry = (
+                str(raw_action).lower() in ["short", "entry_short"] or
+                "SHORT" in str(raw_key).upper() or
+                "SHORT" in str(raw_dir).upper() or
+                (str(raw_action).lower() == "sell" and not open_pos_future)
+            )
+            if is_explicit_short_entry:
+                opt_type = "PE"
+                opt_premium = price_val * 0.012 if symbol_norm == "NIFTY" else price_val * 0.015
+                
+        if opt_type:
+            opt_symbol = f"{symbol_norm} {opt_strike} {opt_type}"
+    
+    # Save signal in database in IST
     signal_entry = Signal(
         symbol=symbol_norm,
         action=action_norm,
         price=price_val,
         source=source,
         source_name=source_name,
-        raw_payload=json.dumps(payload)
+        raw_payload=json.dumps(payload),
+        timestamp=ist_now
     )
     db.add(signal_entry)
     db.commit()
-    
-    # Process Paper Trade
-    # Check for open positions on this symbol
-    open_position = db.query(Position).filter(
-        Position.symbol == symbol_norm,
-        Position.status == "OPEN"
-    ).first()
     
     trade_log = []
     
     # Execution Logic
     if action_norm in ["BUY", "LONG"]:
-        # Check if this signal is an explicit LONG entry
-        # If it's a raw 'buy' and we have an open SHORT position, it serves as a COVER (exit only)
-        # unless it is explicitly 'long' or the user has no open position.
         is_explicit_long_entry = (
             str(raw_action).lower() in ["long", "entry_long"] or
             "LONG" in str(raw_key).upper() or
             "LONG" in str(raw_dir).upper() or
-            (str(raw_action).lower() == "buy" and not open_position)
+            (str(raw_action).lower() == "buy" and not open_pos_future)
         )
         
-        if open_position:
-            # Close existing position
-            open_position.exit_price = price_val
-            open_position.exit_time = datetime.utcnow()
-            open_position.status = "CLOSED"
-            if open_position.direction == "LONG":
-                open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
-            else:
-                open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
-            trade_log.append(f"Closed existing {open_position.direction} position on {symbol_norm}")
+        if open_positions:
+            for p in open_positions:
+                pnl = close_position_entry(p, price_val, db)
+                trade_log.append(f"Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
             
-            # If we had a SHORT position and this is a simple 'buy' (cover) and NOT an explicit long entry,
-            # we do NOT open a new LONG position.
-            if open_position.direction == "SHORT" and not is_explicit_long_entry:
+            if not is_explicit_long_entry:
                 trade_log.append(f"Covered SHORT position on {symbol_norm} (flat)")
-            else:
-                # Reversal / Explicit LONG entry: open a new LONG position
-                qty = calculate_trade_qty(symbol_norm)
-                new_pos = Position(
-                    symbol=symbol_norm,
-                    direction="LONG",
-                    qty=qty,
-                    entry_price=price_val,
-                    status="OPEN"
-                )
-                db.add(new_pos)
-                trade_log.append(f"Opened LONG position for {symbol_norm} (Qty: {qty})")
-        else:
-            # No open position, open new LONG
+                
+        if not open_positions or is_explicit_long_entry:
+            # A. Open Future position
             qty = calculate_trade_qty(symbol_norm)
-            new_pos = Position(
-                symbol=symbol_norm,
-                direction="LONG",
-                qty=qty,
-                entry_price=price_val,
-                status="OPEN"
-            )
-            db.add(new_pos)
-            trade_log.append(f"Opened LONG position for {symbol_norm} (Qty: {qty})")
+            open_position_entry(symbol_norm, "LONG", price_val, qty, db)
+            trade_log.append(f"Opened Future LONG position for {symbol_norm} (Qty: {qty})")
             
+            # B. Open Option position
+            if opt_symbol and opt_premium:
+                open_position_entry(opt_symbol, "LONG", opt_premium, qty, db)
+                trade_log.append(f"Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                
     elif action_norm in ["SELL", "SHORT"]:
-        # Check if this signal is an explicit SHORT entry
-        # If it's a raw 'sell' and we have an open LONG position, it serves as a SELL (exit only)
-        # unless it is explicitly 'short' or the user has no open position.
         is_explicit_short_entry = (
             str(raw_action).lower() in ["short", "entry_short"] or
             "SHORT" in str(raw_key).upper() or
             "SHORT" in str(raw_dir).upper() or
-            (str(raw_action).lower() == "sell" and not open_position)
+            (str(raw_action).lower() == "sell" and not open_pos_future)
         )
         
-        if open_position:
-            # Close existing position
-            open_position.exit_price = price_val
-            open_position.exit_time = datetime.utcnow()
-            open_position.status = "CLOSED"
-            if open_position.direction == "LONG":
-                open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
-            else:
-                open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
-            trade_log.append(f"Closed existing {open_position.direction} position on {symbol_norm}")
+        if open_positions:
+            for p in open_positions:
+                pnl = close_position_entry(p, price_val, db)
+                trade_log.append(f"Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
             
-            # If we had a LONG position and this is a simple 'sell' and NOT an explicit short entry,
-            # we do NOT open a new SHORT position.
-            if open_position.direction == "LONG" and not is_explicit_short_entry:
+            if not is_explicit_short_entry:
                 trade_log.append(f"Exited LONG position on {symbol_norm} (flat)")
-            else:
-                # Reversal / Explicit SHORT entry: open a new SHORT position
-                qty = calculate_trade_qty(symbol_norm)
-                new_pos = Position(
-                    symbol=symbol_norm,
-                    direction="SHORT",
-                    qty=qty,
-                    entry_price=price_val,
-                    status="OPEN"
-                )
-                db.add(new_pos)
-                trade_log.append(f"Opened SHORT position for {symbol_norm} (Qty: {qty})")
-        else:
-            # No open position, open new SHORT
+                
+        if not open_positions or is_explicit_short_entry:
+            # A. Open Future position
             qty = calculate_trade_qty(symbol_norm)
-            new_pos = Position(
-                symbol=symbol_norm,
-                direction="SHORT",
-                qty=qty,
-                entry_price=price_val,
-                status="OPEN"
-            )
-            db.add(new_pos)
-            trade_log.append(f"Opened SHORT position for {symbol_norm} (Qty: {qty})")
+            open_position_entry(symbol_norm, "SHORT", price_val, qty, db)
+            trade_log.append(f"Opened Future SHORT position for {symbol_norm} (Qty: {qty})")
             
-    elif action_norm in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE"]:
-        if open_position:
-            open_position.exit_price = price_val
-            open_position.exit_time = datetime.utcnow()
-            open_position.status = "CLOSED"
-            if open_position.direction == "LONG":
-                open_position.pnl = (price_val - open_position.entry_price) * open_position.qty
-            else:
-                open_position.pnl = (open_position.entry_price - price_val) * open_position.qty
-            trade_log.append(f"Exited {open_position.direction} position on {symbol_norm} at {price_val}")
+            # B. Open Option position (PE Premium is bought, so position direction is LONG)
+            if opt_symbol and opt_premium:
+                open_position_entry(opt_symbol, "LONG", opt_premium, qty, db)
+                trade_log.append(f"Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                
+    elif action_norm in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
+        if open_positions:
+            for p in open_positions:
+                pnl = close_position_entry(p, price_val, db)
+                trade_log.append(f"Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
         else:
             trade_log.append(f"Received exit signal for {symbol_norm} but no open position existed")
             
@@ -455,6 +492,28 @@ def get_live_market_price(symbol: str) -> Optional[float]:
         return None
 
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
+    # 1. Detect if the symbol is an Option contract
+    parts = symbol.split()
+    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    
+    if is_option:
+        underlying = parts[0]
+        opt_type = parts[-1]
+        strike = float(parts[1])
+        
+        # Get live underlying index price
+        live_underlying = get_live_market_price(underlying)
+        if live_underlying is None:
+            # Fallback to latest signal price in database
+            latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
+            live_underlying = latest_signal.price if latest_signal else strike
+            
+        price_change = live_underlying - strike
+        delta = 0.5 if opt_type == "CE" else -0.5
+        current_premium = entry_price + price_change * delta
+        return round(max(1.0, current_premium), 2)
+        
+    # 2. Standard future/equity/crypto price resolution
     # Try to fetch actual live price from Yahoo Finance
     live_price = get_live_market_price(symbol)
     if live_price is not None:
@@ -540,23 +599,24 @@ def manual_exit_position(pos_id: int, db: Session = Depends(get_db)):
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
     
-    # Exit at the current simulated price
-    exit_price = get_current_price(pos.symbol, pos.entry_price, db)
+    # Resolve index exit price
+    parts = pos.symbol.split()
+    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    underlying = parts[0] if is_option else pos.symbol
     
-    pos.exit_price = exit_price
-    pos.exit_time = datetime.utcnow()
-    pos.status = "CLOSED"
-    if pos.direction == "LONG":
-        pos.pnl = round((exit_price - pos.entry_price) * pos.qty, 2)
-    else:
-        pos.pnl = round((pos.entry_price - exit_price) * pos.qty, 2)
+    index_exit_price = get_live_market_price(underlying)
+    if index_exit_price is None:
+        latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
+        index_exit_price = latest_signal.price if latest_signal else pos.entry_price
         
+    close_position_entry(pos, index_exit_price, db)
     db.commit()
     return {"status": "success", "pnl": pos.pnl}
 
 @app.get("/api/consent")
 def check_consent(db: Session = Depends(get_db)):
-    today_str = date.today().isoformat()
+    ist_now = get_ist_time()
+    today_str = ist_now.date().isoformat()
     consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
     return {
         "consent_signed": consent is not None and consent.consent_given,
@@ -566,16 +626,18 @@ def check_consent(db: Session = Depends(get_db)):
 
 @app.post("/api/consent")
 def sign_consent(req: ConsentRequest, db: Session = Depends(get_db)):
-    today_str = date.today().isoformat()
+    ist_now = get_ist_time()
+    today_str = ist_now.date().isoformat()
     consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
     if consent:
         consent.consent_given = True
-        consent.timestamp = datetime.utcnow()
+        consent.timestamp = ist_now
     else:
         consent = DailyConsent(
             date=today_str,
             agreement_text_version=req.agreement_version,
-            consent_given=True
+            consent_given=True,
+            timestamp=ist_now
         )
         db.add(consent)
     db.commit()
