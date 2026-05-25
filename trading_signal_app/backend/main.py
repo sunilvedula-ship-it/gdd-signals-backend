@@ -240,19 +240,38 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     
     # 3. Resolve Price
     price = payload.get("price") or payload.get("signal_price")
-    if price is None and body_str:
-        # Search for a decimal/float number in the body
-        import re
-        numbers = re.findall(r"\b\d+(?:\.\d+)?\b", body_str)
-        if numbers:
-            price = numbers[0]
-            
-    if price is None:
-        price_val = 0.0
-    else:
+    price_val = None
+    
+    if price is not None:
         try:
             price_val = float(price)
         except (ValueError, TypeError):
+            pass
+            
+    is_json = False
+    if body_str:
+        try:
+            json.loads(body_str)
+            is_json = True
+        except Exception:
+            pass
+            
+    if price_val is None and not is_json and body_str:
+        # Search for a decimal/float number in the plain text body
+        import re
+        numbers = re.findall(r"\b\d+(?:\.\d+)?\b", body_str)
+        if numbers:
+            try:
+                price_val = float(numbers[0])
+            except ValueError:
+                pass
+                
+    # If still no price found or resolves to 0.0, fetch from live TradingView price feed
+    if price_val is None or price_val == 0.0:
+        live_price = get_live_market_price(symbol_norm)
+        if live_price is not None:
+            price_val = live_price
+        else:
             price_val = 0.0
         
     # 4. Resolve Action
@@ -303,9 +322,22 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     consent_signed = consent is not None and consent.consent_given
     
     # Process Paper Trade
+    # Normalize underlying symbol for options checking
+    underlying_norm = symbol_norm
+    if underlying_norm.endswith("1!"):
+        underlying_norm = underlying_norm[:-2]
+    elif underlying_norm.endswith("1"):
+        underlying_norm = underlying_norm[:-1]
+        
+    if underlying_norm in ["BSX", "SENSEX"]:
+        underlying_norm = "SENSEX"
+        
     # Check for open positions on this symbol or its options
     open_positions = db.query(Position).filter(
-        (Position.symbol == symbol_norm) | (Position.symbol.like(f"{symbol_norm} %")),
+        (Position.symbol == symbol_norm) | 
+        (Position.symbol == underlying_norm) |
+        (Position.symbol.like(f"{symbol_norm} %")) |
+        (Position.symbol.like(f"{underlying_norm} %")),
         Position.status == "OPEN"
     ).all()
     
@@ -319,19 +351,19 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             action_norm = "COVER"
             
     # Calculate Option details (At-The-Money CE/PE option contract)
-    has_options = symbol_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
+    has_options = underlying_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
     opt_strike = None
     opt_symbol = None
     opt_premium = None
     opt_type = None
     
     if has_options and price_val > 0:
-        step = 50 if symbol_norm == "NIFTY" else 100
+        step = 50 if underlying_norm == "NIFTY" else 100
         opt_strike = int(round(price_val / step) * step)
         
         if action_norm in ["BUY", "LONG"]:
             opt_type = "CE"
-            opt_premium = price_val * 0.012 if symbol_norm == "NIFTY" else price_val * 0.015
+            opt_premium = price_val * 0.012 if underlying_norm == "NIFTY" else price_val * 0.015
         elif action_norm in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
                 str(raw_action).lower() in ["short", "entry_short"] or
@@ -341,10 +373,10 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             )
             if is_explicit_short_entry:
                 opt_type = "PE"
-                opt_premium = price_val * 0.012 if symbol_norm == "NIFTY" else price_val * 0.015
+                opt_premium = price_val * 0.012 if underlying_norm == "NIFTY" else price_val * 0.015
                 
         if opt_type:
-            opt_symbol = f"{symbol_norm} {opt_strike} {opt_type}"
+            opt_symbol = f"{underlying_norm} {opt_strike} {opt_type}"
     
     # Save signal in database in IST
     signal_entry = Signal(
