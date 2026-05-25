@@ -907,9 +907,6 @@ def get_user_profile(db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == 1).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Calculate days remaining in 5 working-day trial
-    # Simple mock check
     trial_days_left = 5
     return {
         "name": user.name,
@@ -918,6 +915,163 @@ def get_user_profile(db: Session = Depends(get_db)):
         "subscription_status": user.subscription_status,
         "trial_days_left": trial_days_left
     }
+
+class ExecuteOrderRequest(BaseModel):
+    signal_id: int
+    trade_type: str  # FUTURE or OPTION
+    mode: str        # LIVE or PAPER
+    lots: float
+
+def get_lot_size(symbol: str) -> int:
+    sym = symbol.upper()
+    if "BANKNIFTY" in sym:
+        return 30
+    elif "NIFTY" in sym:
+        return 65
+    elif "SENSEX" in sym:
+        return 20
+    elif "CRUDE" in sym:
+        return 100
+    elif "GOLD" in sym:
+        return 100
+    elif "WIPRO" in sym:
+        return 1500
+    elif "RELIANCE" in sym:
+        return 250
+    elif "TITAN" in sym:
+        return 375
+    elif "BAJFINSERV" in sym:
+        return 500
+    elif "ADANIPORTS" in sym:
+        return 625
+    else:
+        return 100
+
+@app.get("/api/broker/status")
+def get_broker_status(db: Session = Depends(get_db)):
+    mgr = AppCredentialsManager(db)
+    active_id = mgr.get_active_broker()
+    
+    # Calculate open positions combined live open P&L
+    positions = db.query(Position).filter(Position.status == "OPEN").all()
+    combined_pnl = 0.0
+    for p in positions:
+        current_price = get_current_price(p.symbol, p.entry_price, db)
+        if p.direction == "LONG":
+            pnl = (current_price - p.entry_price) * p.qty
+        else:
+            pnl = (p.entry_price - current_price) * p.qty
+        combined_pnl += pnl
+            
+    if active_id:
+        masked = mgr.get_masked_info(active_id)
+        return {
+            "status": "linked",
+            "broker_id": active_id,
+            "broker_name": masked["broker_id"].capitalize(),
+            "balance": 245000.00,  # Simulated active margin balance
+            "mode": "LIVE",
+            "combined_open_pnl": round(combined_pnl, 2)
+        }
+    else:
+        return {
+            "status": "sandbox",
+            "broker_id": "sandbox",
+            "broker_name": "Sandbox Broker",
+            "balance": 1000000.00,  # 10 Lakh INR sandbox capital
+            "mode": "SANDBOX",
+            "combined_open_pnl": round(combined_pnl, 2)
+        }
+
+@app.post("/api/broker/execute")
+def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)):
+    signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+        
+    # Check if the signal is still active (no subsequent exit alert on the symbol)
+    exit_exists = db.query(Signal).filter(
+        Signal.symbol == signal.symbol,
+        Signal.action.in_(["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL", "COVER"]),
+        Signal.timestamp > signal.timestamp
+    ).first()
+    if exit_exists:
+        raise HTTPException(status_code=400, detail="This signal is no longer active (an exit signal has already been received)")
+        
+    # Check duplicate trade prevention per signal
+    existing = db.query(Position).filter(Position.signal_id == req.signal_id).first()
+    if existing:
+        lots_used = existing.lot_size or 1
+        raise HTTPException(
+            status_code=400, 
+            detail=f"A trade is already running on this signal with {lots_used} lots. You cannot place another trade on the same signal."
+        )
+        
+    # Calculate Qty based on Lots
+    sym_upper = signal.symbol.upper()
+    is_crypto = "BTC" in sym_upper or "ETH" in sym_upper or "SOL" in sym_upper or "USD" in sym_upper or "USDT" in sym_upper
+    
+    if is_crypto:
+        qty = req.lots
+    else:
+        qty = req.lots * get_lot_size(signal.symbol)
+        
+    # Strike and premium / entry price resolution
+    if req.trade_type == "OPTION":
+        step = 50 if "NIFTY" in sym_upper else 100
+        underlying_price = get_live_market_price(signal.symbol) or signal.price
+        opt_strike = int(round(underlying_price / step) * step)
+        opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
+        trade_symbol = f"{signal.symbol} {opt_strike} {opt_type}"
+        
+        entry_price = underlying_price * 0.012 if "NIFTY" in sym_upper else underlying_price * 0.015
+        direction = "LONG"
+    else:
+        trade_symbol = signal.symbol
+        entry_price = get_live_market_price(signal.symbol) or signal.price
+        direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
+        
+    # Create the position
+    new_pos = Position(
+        symbol=trade_symbol,
+        direction=direction,
+        qty=qty,
+        lot_size=int(req.lots),
+        entry_price=round(entry_price, 2),
+        entry_time=get_ist_time(),
+        status="OPEN",
+        real_or_paper=req.mode,
+        signal_id=req.signal_id
+    )
+    db.add(new_pos)
+    db.commit()
+    
+    return {
+        "status": "success",
+        "symbol": trade_symbol,
+        "qty": qty,
+        "entry_price": entry_price,
+        "mode": req.mode
+    }
+
+@app.post("/api/broker/manual-exit/{pos_id}")
+def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db)):
+    pos = db.query(Position).filter(Position.id == pos_id, Position.status == "OPEN").first()
+    if not pos:
+        raise HTTPException(status_code=404, detail="Open position not found")
+        
+    parts = pos.symbol.split()
+    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    underlying = parts[0] if is_option else pos.symbol
+    
+    index_exit_price = get_live_market_price(underlying)
+    if index_exit_price is None:
+        latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
+        index_exit_price = latest_signal.price if latest_signal else pos.entry_price
+        
+    close_position_entry(pos, index_exit_price, db)
+    db.commit()
+    return {"status": "success", "pnl": pos.pnl}
 
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root

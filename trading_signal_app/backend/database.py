@@ -72,6 +72,7 @@ class Position(Base):
     status = Column(String, default="OPEN")  # OPEN, CLOSED
     pnl = Column(Float, default=0.0)
     real_or_paper = Column(String, default="PAPER")  # PAPER, LIVE
+    signal_id = Column(Integer, ForeignKey('signals.id'), nullable=True)
 
 class DailyConsent(Base):
     __tablename__ = 'daily_consents'
@@ -95,6 +96,21 @@ class BrokerCredential(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Automatically add signal_id column to positions table if it does not exist
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        if "postgresql" in DATABASE_URL:
+            db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS signal_id INTEGER;"))
+        else:
+            db.execute(text("ALTER TABLE positions ADD COLUMN signal_id INTEGER;"))
+        db.commit()
+        print("[DB] Successfully verified/added signal_id column to positions table.")
+    except Exception as e:
+        print(f"[DB] Migration note: {e}")
+        pass
+    finally:
+        db.close()
 
 def get_db():
     db = SessionLocal()
