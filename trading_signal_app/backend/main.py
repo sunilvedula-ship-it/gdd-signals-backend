@@ -903,23 +903,6 @@ def get_user_profile(db: Session = Depends(get_db)):
         "trial_days_left": trial_days_left
     }
 
-@app.post("/api/admin/purge-faulty")
-def purge_faulty_trades(db: Session = Depends(get_db)):
-    # Purge positions with trillion-rupee entries (price > 1 billion)
-    faulty_positions = db.query(Position).filter(Position.entry_price > 1000000000).all()
-    count_pos = len(faulty_positions)
-    for p in faulty_positions:
-        db.delete(p)
-        
-    # Purge signals with trillion-rupee entries
-    faulty_signals = db.query(Signal).filter(Signal.price > 1000000000).all()
-    count_sig = len(faulty_signals)
-    for s in faulty_signals:
-        db.delete(s)
-        
-    db.commit()
-    return {"status": "success", "purged_positions": count_pos, "purged_signals": count_sig}
-
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root
 simulator_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "simulator")
