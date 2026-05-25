@@ -155,8 +155,7 @@ def calculate_trade_qty(symbol: str) -> float:
         return 30.0  # 1 lot Banknifty
     elif "NIFTY" in sym:
         return 65.0  # 1 lot Nifty
-    elif "SENSEX" in sym:
-
+    elif "SENSEX" in sym or "BSX" in sym:
         return 20.0  # 1 lot Sensex
     elif any(crypto in sym for crypto in ["BTC", "ETH", "SOL"]):
         return 1.0   # 1 qty for Cryptos
@@ -928,7 +927,7 @@ def get_lot_size(symbol: str) -> int:
         return 30
     elif "NIFTY" in sym:
         return 65
-    elif "SENSEX" in sym:
+    elif "SENSEX" in sym or "BSX" in sym:
         return 20
     elif "CRUDE" in sym:
         return 100
@@ -989,22 +988,44 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
         
+    # Block manual entry executions on exit signals (Sell, Cover, Exit)
+    if signal.action.upper() in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="This is an exit signal (Sell/Cover). Entries are only allowed on Long or Short signals."
+        )
+
     # Check if the signal is still active (no subsequent exit alert on the symbol)
     exit_exists = db.query(Signal).filter(
         Signal.symbol == signal.symbol,
-        Signal.action.in_(["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL", "COVER"]),
+        Signal.action.in_(["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL"]),
         Signal.timestamp > signal.timestamp
     ).first()
     if exit_exists:
         raise HTTPException(status_code=400, detail="This signal is no longer active (an exit signal has already been received)")
         
-    # Check duplicate trade prevention per signal
-    existing = db.query(Position).filter(Position.signal_id == req.signal_id).first()
+    # Check duplicate trade prevention per signal and contract type separately
+    existing = None
+    if req.trade_type == "OPTION":
+        existing = db.query(Position).filter(
+            Position.signal_id == req.signal_id,
+            (Position.symbol.like("% CE") | Position.symbol.like("% PE") | Position.symbol.like("%CE%") | Position.symbol.like("%PE%"))
+        ).first()
+    else:
+        # FUTURE
+        existing = db.query(Position).filter(
+            Position.signal_id == req.signal_id,
+            ~Position.symbol.like("% CE"),
+            ~Position.symbol.like("% PE"),
+            ~Position.symbol.like("%CE%"),
+            ~Position.symbol.like("%PE%")
+        ).first()
+
     if existing:
         lots_used = existing.lot_size or 1
         raise HTTPException(
             status_code=400, 
-            detail=f"A trade is already running on this signal with {lots_used} lots. You cannot place another trade on the same signal."
+            detail=f"A {req.trade_type} trade is already running on this signal with {lots_used} lots. You cannot place another {req.trade_type} trade on the same signal."
         )
         
     # Calculate Qty based on Lots
