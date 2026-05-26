@@ -286,6 +286,12 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             action_norm = "EXIT"
         elif act_lower in ["buy", "sell", "long", "short"]:
             action_norm = "LONG" if act_lower in ["buy", "long"] else "SHORT"
+        elif act_lower == "entry":
+            dir_str = str(raw_dir or "").upper()
+            if "LONG" in dir_str or "BUY" in dir_str:
+                action_norm = "LONG"
+            elif "SHORT" in dir_str or "SELL" in dir_str:
+                action_norm = "SHORT"
     elif raw_key:
         key_str = str(raw_key).upper()
         if "LONG" in key_str or "BUY" in key_str:
