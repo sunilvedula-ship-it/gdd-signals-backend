@@ -1100,6 +1100,22 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "pnl": pos.pnl}
 
+@app.post("/api/admin/purge-test-data")
+def purge_test_data(db: Session = Depends(get_db)):
+    try:
+        num_positions = db.query(Position).delete()
+        num_signals = db.query(Signal).delete()
+        db.commit()
+        return {
+            "status": "success",
+            "purged_positions": num_positions,
+            "purged_signals": num_signals,
+            "detail": "Successfully cleared all database signals and positions."
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error during purge: {e}")
+
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root
 simulator_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "simulator")
