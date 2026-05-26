@@ -177,6 +177,27 @@ def calculate_trade_qty(symbol: str) -> float:
     else:
         return 100.0  # Default fallback lot size
 
+def calculate_option_premium(symbol: str, index_price: float) -> float:
+    sym = symbol.upper().strip()
+    # Weekly indices: NIFTY, SENSEX, BSX
+    # Monthly indices: BANKNIFTY, BNF
+    is_weekly = "NIFTY" in sym or "SENSEX" in sym or "BSX" in sym
+    is_banknifty = "BANKNIFTY" in sym or "BNF" in sym
+    
+    if is_banknifty:
+        return round(index_price * 0.015, 2)      # 1.5% of index value standard
+    elif is_weekly:
+        ist_now = get_ist_time()
+        # Nifty expiry typically Thursdays, FinNifty Tuesdays, Sensex Fridays.
+        # Check if weekday is Tuesday (1), Thursday (3), or Friday (4).
+        is_expiry_day = ist_now.weekday() in [1, 3, 4]
+        if is_expiry_day:
+            return round(index_price * 0.003, 2)  # 0.3% of index value
+        else:
+            return round(index_price * 0.006, 2)  # 0.6% of index value
+    else:
+        return round(index_price * 0.012, 2)      # 1.2% fallback
+
 @app.post("/api/signals/webhook")
 async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     body_bytes = await request.body()
@@ -322,6 +343,19 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
 
     # Check if daily consent is signed for today (based on IST date)
     ist_now = get_ist_time()
+
+    # 15-second Deduplication check
+    fifteen_secs_ago = ist_now - timedelta(seconds=15)
+    duplicate = db.query(Signal).filter(
+        Signal.symbol == symbol_norm,
+        Signal.action == action_norm,
+        Signal.source_name == source_name,
+        Signal.timestamp >= fifteen_secs_ago
+    ).first()
+    if duplicate:
+        print(f"[Webhook Skipped] Duplicate signal detected for {symbol_norm} with action {action_norm} from {source_name} within last 15 seconds")
+        return {"status": "skipped", "reason": "duplicate signal received"}
+
     today_str = ist_now.date().isoformat()
     consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
     consent_signed = consent is not None and consent.consent_given
@@ -368,7 +402,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         
         if action_norm in ["BUY", "LONG"]:
             opt_type = "CE"
-            opt_premium = price_val * 0.012 if underlying_norm == "NIFTY" else price_val * 0.015
+            opt_premium = calculate_option_premium(underlying_norm, price_val)
         elif action_norm in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
                 str(raw_action).lower() in ["short", "entry_short"] or
@@ -378,7 +412,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             )
             if is_explicit_short_entry:
                 opt_type = "PE"
-                opt_premium = price_val * 0.012 if underlying_norm == "NIFTY" else price_val * 0.015
+                opt_premium = calculate_option_premium(underlying_norm, price_val)
                 
         if opt_type:
             opt_symbol = f"{underlying_norm} {opt_strike} {opt_type}"
@@ -1051,7 +1085,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
         trade_symbol = f"{signal.symbol} {opt_strike} {opt_type}"
         
-        entry_price = underlying_price * 0.012 if "NIFTY" in sym_upper else underlying_price * 0.015
+        entry_price = calculate_option_premium(signal.symbol, underlying_price)
         direction = "LONG"
     else:
         trade_symbol = signal.symbol
