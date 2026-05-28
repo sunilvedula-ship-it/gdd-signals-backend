@@ -363,12 +363,11 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     # Process Paper Trade
     # Normalize underlying symbol for options checking
     underlying_norm = symbol_norm
-    if underlying_norm.endswith("1!"):
-        underlying_norm = underlying_norm[:-2]
-    elif underlying_norm.endswith("1"):
-        underlying_norm = underlying_norm[:-1]
-        
-    if underlying_norm in ["BSX", "SENSEX"]:
+    if "BANKNIFTY" in underlying_norm or "BNF" in underlying_norm:
+        underlying_norm = "BANKNIFTY"
+    elif "NIFTY" in underlying_norm:
+        underlying_norm = "NIFTY"
+    elif "SENSEX" in underlying_norm or "BSX" in underlying_norm:
         underlying_norm = "SENSEX"
         
     # Check for open positions on this symbol or its options
@@ -404,15 +403,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             opt_type = "CE"
             opt_premium = calculate_option_premium(underlying_norm, price_val)
         elif action_norm in ["SELL", "SHORT"]:
-            is_explicit_short_entry = (
-                str(raw_action).lower() in ["short", "entry_short"] or
-                "SHORT" in str(raw_key).upper() or
-                "SHORT" in str(raw_dir).upper() or
-                (str(raw_action).lower() == "sell" and not open_pos_future)
-            )
-            if is_explicit_short_entry:
-                opt_type = "PE"
-                opt_premium = calculate_option_premium(underlying_norm, price_val)
+            opt_type = "PE"
+            opt_premium = calculate_option_premium(underlying_norm, price_val)
                 
         if opt_type:
             opt_symbol = f"{underlying_norm} {opt_strike} {opt_type}"
