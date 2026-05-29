@@ -791,7 +791,9 @@ def get_paper_trades(db: Session = Depends(get_db)):
                 "exit_time": None,
                 "status": p.status,
                 "current_price": current_price,
-                "pnl": round(pnl, 2)
+                "pnl": round(pnl, 2),
+                "real_or_paper": p.real_or_paper,
+                "signal_id": p.signal_id
             })
         else:
             pnl = p.pnl
@@ -810,7 +812,9 @@ def get_paper_trades(db: Session = Depends(get_db)):
                 "exit_price": p.exit_price,
                 "exit_time": p.exit_time.isoformat() if p.exit_time else None,
                 "status": p.status,
-                "pnl": p.pnl
+                "pnl": p.pnl,
+                "real_or_paper": p.real_or_paper,
+                "signal_id": p.signal_id
             })
             
     total_trades = len(closed_positions)
