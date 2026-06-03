@@ -102,8 +102,28 @@ def get_ist_time() -> datetime:
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
-    if s == "XAUUSD" or "XAU" in s:
+    
+    # Strip TV futures suffixes
+    if s.endswith("1!"):
+        s = s[:-2]
+    elif s.endswith("!"):
+        s = s[:-1]
+    
+    if ":" in s:
+        s = s.split(":")[-1]
+        
+    if "XAUUSD" in s or "XAU" in s or "GOLD" in s:
         return "GOLD"
+    if "SILVER" in s:
+        return "SILVER"
+    if "BANKNIFTY" in s or "BNF" in s:
+        return "BANKNIFTY"
+    if "NIFTY" in s:
+        return "NIFTY"
+    if "SENSEX" in s or "BSX" in s:
+        return "SENSEX"
+    if "CRUDE" in s:
+        return "CRUDEOIL"
     return s
 
 def extract_strike_from_symbol(symbol: str) -> Optional[float]:
@@ -473,7 +493,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     # Execution Logic
     if action_norm in ["BUY", "LONG"]:
         is_explicit_long_entry = (
-            str(raw_action).lower() in ["long", "entry_long"] or
+            raw_action is None or
+            str(raw_action).lower() in ["long", "entry_long", "entry"] or
             "LONG" in str(raw_key).upper() or
             "LONG" in str(raw_dir).upper() or
             (str(raw_action).lower() == "buy" and not open_pos_future)
@@ -500,7 +521,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 
     elif action_norm in ["SELL", "SHORT"]:
         is_explicit_short_entry = (
-            str(raw_action).lower() in ["short", "entry_short"] or
+            raw_action is None or
+            str(raw_action).lower() in ["short", "entry_short", "entry"] or
             "SHORT" in str(raw_key).upper() or
             "SHORT" in str(raw_dir).upper() or
             (str(raw_action).lower() == "sell" and not open_pos_future)
