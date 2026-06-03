@@ -1172,6 +1172,20 @@ def purge_test_data(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error during purge: {e}")
 
+@app.get("/api/admin/dump-signals")
+def dump_signals(db: Session = Depends(get_db)):
+    signals = db.query(Signal).order_by(Signal.id.desc()).limit(15).all()
+    return [{
+        "id": s.id,
+        "timestamp": s.timestamp.isoformat(),
+        "symbol": s.symbol,
+        "action": s.action,
+        "price": s.price,
+        "source": s.source,
+        "source_name": s.source_name,
+        "raw_payload": s.raw_payload
+    } for s in signals]
+
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root
 simulator_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "simulator")
