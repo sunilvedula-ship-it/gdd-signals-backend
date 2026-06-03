@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, Linking } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, TextInput, TouchableOpacity, ActivityIndicator, Linking, Alert } from 'react-native';
 import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
@@ -15,6 +15,37 @@ export default function SettingsScreen() {
       await supabase.auth.signOut();
     } catch (error) {
       console.error("Error signing out:", error);
+    }
+  };
+
+  const handlePurgeData = () => {
+    Alert.alert(
+      "Confirm Database Purge",
+      "This will permanently delete all signals and positions from the database. This action is irreversible. Proceed?",
+      [
+        { text: "Cancel", style: "cancel" },
+        { text: "Purge Data", style: "destructive", onPress: executePurge }
+      ]
+    );
+  };
+
+  const executePurge = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/admin/purge-test-data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await response.json();
+      if (response.ok) {
+        Alert.alert("Purge Successful", `Database cleaned successfully.\n- Signals Deleted: ${data.purged_signals}\n- Positions Deleted: ${data.purged_positions}`);
+      } else {
+        Alert.alert("Purge Failed", data.detail || "Could not clear data.");
+      }
+    } catch (error) {
+      Alert.alert("Network Error", error.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -98,7 +129,7 @@ export default function SettingsScreen() {
         {configuredBroker ? (
           <View style={styles.configuredContainer}>
             <Text style={styles.configuredTitle}>✓ Configured: {configuredBroker.name}</Text>
-            <Text style={styles.configuredSub}>{configuredBroker.info.api_key_masked}</Text>
+            <Text style={styles.configuredSub}>{configuredBroker.info?.api_key_masked || 'Configured'}</Text>
             <TouchableOpacity style={styles.deleteBtn} onPress={() => deleteCredentials(configuredBroker.id)}>
               <Text style={styles.deleteBtnText}>Delete API Credentials</Text>
             </TouchableOpacity>
@@ -158,6 +189,14 @@ export default function SettingsScreen() {
       <View style={styles.card}>
         <TouchableOpacity style={styles.logoutBtn} onPress={handleLogout}>
           <Text style={styles.logoutBtnText}>Log Out of Account</Text>
+        </TouchableOpacity>
+      </View>
+
+      <Text style={styles.sectionTitle}>5. Developer Testing Controls</Text>
+      <View style={styles.card}>
+        <Text style={styles.cardText}>Wipe all database positions and signals to start with a completely fresh slate during your testing period.</Text>
+        <TouchableOpacity style={styles.purgeBtn} onPress={handlePurgeData}>
+          <Text style={styles.purgeBtnText}>Purge All Signals & Positions</Text>
         </TouchableOpacity>
       </View>
     </ScrollView>
@@ -310,6 +349,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   logoutBtnText: {
+    color: '#ef4444',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  purgeBtn: {
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    borderColor: 'rgba(239, 68, 68, 0.35)',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    alignItems: 'center',
+  },
+  purgeBtnText: {
     color: '#ef4444',
     fontSize: 12,
     fontWeight: 'bold',
