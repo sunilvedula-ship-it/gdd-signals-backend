@@ -209,7 +209,7 @@ def calculate_option_premium(symbol: str, index_price: float) -> float:
     is_banknifty = "BANKNIFTY" in sym or "BNF" in sym
     
     if is_banknifty:
-        return round(index_price * 0.0185, 2)      # 1.85% of index value standard (matches ~1000 premium at 54300 index)
+        return round(index_price * 0.021, 2)      # 2.1% of index value standard (matches ~1124 premium at 54400 strike)
     elif is_weekly:
         ist_now = get_ist_time()
         # Nifty expiry typically Thursdays, FinNifty Tuesdays, Sensex Fridays.
