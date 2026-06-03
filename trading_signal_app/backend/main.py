@@ -287,7 +287,10 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
         underlying = parts[0]
         opt_type = parts[-1]
         strike = float(parts[1])
-        exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price)
+        if index_exit_price > 0 and index_exit_price < 0.2 * strike:
+            exit_price = index_exit_price
+        else:
+            exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price)
     else:
         exit_price = index_exit_price
         
