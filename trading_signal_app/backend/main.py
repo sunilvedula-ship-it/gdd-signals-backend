@@ -341,17 +341,47 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         elif dir_str in ["SHORT", "SELL"]:
             action_norm = "SHORT"
     elif body_str:
-        body_upper = body_str.upper()
-        if "EXIT_LONG" in body_upper or "SELLALERT" in body_upper:
-            action_norm = "EXIT_LONG"
-        elif "EXIT_SHORT" in body_upper or "COVER" in body_upper:
-            action_norm = "EXIT_SHORT"
-        elif "BUY" in body_upper or "LONG" in body_upper:
-            action_norm = "LONG"
-        elif "SELL" in body_upper or "SHORT" in body_upper:
-            action_norm = "SHORT"
-        elif "EXIT" in body_upper or "COVER" in body_upper:
-            action_norm = "EXIT"
+        search_text = body_str
+        if isinstance(payload, dict):
+            if "text" in payload:
+                search_text = str(payload["text"])
+            elif "message" in payload:
+                search_text = str(payload["message"])
+                
+        if search_text:
+            text_upper = search_text.upper()
+            import re
+            
+            # 1. Precise Word Boundary Checks
+            if re.search(r"\bEXIT_LONG\b", text_upper) or re.search(r"\bSELLALERT\b", text_upper) or re.search(r"\bSELL_ALERT\b", text_upper) or re.search(r"\bEXIT\s+LONG\b", text_upper) or re.search(r"\bSELL\s+ALERT\b", text_upper):
+                action_norm = "EXIT_LONG"
+            elif re.search(r"\bEXIT_SHORT\b", text_upper) or re.search(r"\bCOVERALERT\b", text_upper) or re.search(r"\bCOVER_ALERT\b", text_upper) or re.search(r"\bEXIT\s+SHORT\b", text_upper) or re.search(r"\bCOVER\s+ALERT\b", text_upper):
+                action_norm = "EXIT_SHORT"
+            elif re.search(r"\bEXIT\b", text_upper) or re.search(r"\bCLOSE\b", text_upper):
+                action_norm = "EXIT"
+            elif re.search(r"\bCOVER\b", text_upper):
+                action_norm = "EXIT_SHORT"
+            elif re.search(r"\bLONG\b", text_upper) or re.search(r"\bBUY\b", text_upper):
+                action_norm = "LONG"
+            elif re.search(r"\bSHORT\b", text_upper) or re.search(r"\bSELL\b", text_upper):
+                action_norm = "SHORT"
+                
+            # 2. Fallback to Substring Checks
+            else:
+                if "EXIT_LONG" in text_upper or "SELLALERT" in text_upper or "SELL_ALERT" in text_upper:
+                    action_norm = "EXIT_LONG"
+                elif "EXIT_SHORT" in text_upper or "COVER" in text_upper:
+                    action_norm = "EXIT_SHORT"
+                elif "BUY" in text_upper or "LONG" in text_upper:
+                    if "BUY" in text_upper and "OPTIONBUYING" in text_upper and not "BUY " in text_upper and not " BUY" in text_upper:
+                        pass
+                    else:
+                        action_norm = "LONG"
+                elif "SELL" in text_upper or "SHORT" in text_upper:
+                    action_norm = "SHORT"
+                elif "EXIT" in text_upper:
+                    action_norm = "EXIT"
+            
             
     # Resolve source
     source = payload.get("source") or ("TradingView" if (raw_key or "tradingview" in body_str.lower()) else "Scanner")
@@ -1171,20 +1201,6 @@ def purge_test_data(db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error during purge: {e}")
-
-@app.get("/api/admin/dump-signals")
-def dump_signals(db: Session = Depends(get_db)):
-    signals = db.query(Signal).order_by(Signal.id.desc()).limit(15).all()
-    return [{
-        "id": s.id,
-        "timestamp": s.timestamp.isoformat(),
-        "symbol": s.symbol,
-        "action": s.action,
-        "price": s.price,
-        "source": s.source,
-        "source_name": s.source_name,
-        "raw_payload": s.raw_payload
-    } for s in signals]
 
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root
