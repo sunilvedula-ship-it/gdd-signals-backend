@@ -140,11 +140,12 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
     
     if is_option:
+        underlying = parts[0]
         opt_type = parts[-1]
         strike = float(parts[1])
-        price_change = index_exit_price - strike
+        base_prem = calculate_option_premium(underlying, strike)
         delta = 0.5 if opt_type == "CE" else -0.5
-        exit_price = max(1.0, pos.entry_price + price_change * delta)
+        exit_price = max(1.0, base_prem + (index_exit_price - strike) * delta)
     else:
         exit_price = index_exit_price
         
@@ -208,7 +209,7 @@ def calculate_option_premium(symbol: str, index_price: float) -> float:
     is_banknifty = "BANKNIFTY" in sym or "BNF" in sym
     
     if is_banknifty:
-        return round(index_price * 0.015, 2)      # 1.5% of index value standard
+        return round(index_price * 0.0185, 2)      # 1.85% of index value standard (matches ~1000 premium at 54300 index)
     elif is_weekly:
         ist_now = get_ist_time()
         # Nifty expiry typically Thursdays, FinNifty Tuesdays, Sensex Fridays.
@@ -467,12 +468,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         
         if action_norm in ["BUY", "LONG"]:
             opt_type = "CE"
-            opt_premium = calculate_option_premium(underlying_norm, price_val)
         elif action_norm in ["SELL", "SHORT"]:
             opt_type = "PE"
-            opt_premium = calculate_option_premium(underlying_norm, price_val)
                 
         if opt_type:
+            base_prem = calculate_option_premium(underlying_norm, opt_strike)
+            delta = 0.5 if opt_type == "CE" else -0.5
+            opt_premium = base_prem + (price_val - opt_strike) * delta
             opt_symbol = f"{underlying_norm} {opt_strike} {opt_type}"
     
     # Save signal in database in IST
@@ -791,9 +793,9 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
             live_underlying = latest_signal.price if latest_signal else strike
             
-        price_change = live_underlying - strike
+        base_prem = calculate_option_premium(underlying, strike)
         delta = 0.5 if opt_type == "CE" else -0.5
-        current_premium = entry_price + price_change * delta
+        current_premium = base_prem + (live_underlying - strike) * delta
         return round(max(1.0, current_premium), 2)
         
     # 2. Standard future/equity/crypto price resolution
@@ -1159,7 +1161,9 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
         trade_symbol = f"{signal.symbol} {opt_strike} {opt_type}"
         
-        entry_price = calculate_option_premium(signal.symbol, underlying_price)
+        base_prem = calculate_option_premium(signal.symbol, opt_strike)
+        delta = 0.5 if opt_type == "CE" else -0.5
+        entry_price = base_prem + (underlying_price - opt_strike) * delta
         direction = "LONG"
     else:
         trade_symbol = signal.symbol
