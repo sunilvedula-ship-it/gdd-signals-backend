@@ -101,7 +101,10 @@ def get_ist_time() -> datetime:
 
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
-    return symbol.upper().strip()
+    s = symbol.upper().strip()
+    if s == "XAUUSD" or "XAU" in s:
+        return "GOLD"
+    return s
 
 def extract_strike_from_symbol(symbol: str) -> Optional[float]:
     parts = symbol.split()
@@ -303,10 +306,16 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     
     if raw_action:
         act_lower = str(raw_action).lower()
-        if act_lower in ["exit", "close", "cover", "exit_long", "exit_short"]:
+        if act_lower in ["exit_long", "exitlong"]:
+            action_norm = "EXIT_LONG"
+        elif act_lower in ["exit_short", "exitshort", "cover"]:
+            action_norm = "EXIT_SHORT"
+        elif act_lower in ["exit", "close"]:
             action_norm = "EXIT"
-        elif act_lower in ["buy", "sell", "long", "short"]:
-            action_norm = "LONG" if act_lower in ["buy", "long"] else "SHORT"
+        elif act_lower in ["buy", "long"]:
+            action_norm = "LONG"
+        elif act_lower in ["sell", "short"]:
+            action_norm = "SHORT" if act_lower == "short" else "SELL"
         elif act_lower == "entry":
             dir_str = str(raw_dir or "").upper()
             if "LONG" in dir_str or "BUY" in dir_str:
@@ -315,12 +324,16 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 action_norm = "SHORT"
     elif raw_key:
         key_str = str(raw_key).upper()
-        if "LONG" in key_str or "BUY" in key_str:
+        if "EXIT_LONG" in key_str or "SELLALERT" in key_str or "SELL_ALERT" in key_str:
+            action_norm = "EXIT_LONG"
+        elif "EXIT_SHORT" in key_str or "COVER" in key_str:
+            action_norm = "EXIT_SHORT"
+        elif "EXIT" in key_str or "CLOSE" in key_str:
+            action_norm = "EXIT"
+        elif "LONG" in key_str or "BUY" in key_str:
             action_norm = "LONG"
         elif "SHORT" in key_str or "SELL" in key_str:
             action_norm = "SHORT"
-        elif "COVER" in key_str or "EXIT" in key_str:
-            action_norm = "EXIT"
     elif raw_dir:
         dir_str = str(raw_dir).upper()
         if dir_str in ["LONG", "BUY"]:
@@ -328,9 +341,12 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         elif dir_str in ["SHORT", "SELL"]:
             action_norm = "SHORT"
     elif body_str:
-        # Fallback to search inside raw body text
         body_upper = body_str.upper()
-        if "BUY" in body_upper or "LONG" in body_upper:
+        if "EXIT_LONG" in body_upper or "SELLALERT" in body_upper:
+            action_norm = "EXIT_LONG"
+        elif "EXIT_SHORT" in body_upper or "COVER" in body_upper:
+            action_norm = "EXIT_SHORT"
+        elif "BUY" in body_upper or "LONG" in body_upper:
             action_norm = "LONG"
         elif "SELL" in body_upper or "SHORT" in body_upper:
             action_norm = "SHORT"
@@ -482,8 +498,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     elif action_norm in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
         if open_positions:
             for p in open_positions:
-                pnl = close_position_entry(p, price_val, db)
-                trade_log.append(f"Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
+                # Direction-aware exit check to prevent exit-ordering race conditions
+                should_close = False
+                if action_norm in ["EXIT", "CLOSE"]:
+                    should_close = True
+                elif action_norm == "EXIT_LONG" and p.direction == "LONG":
+                    should_close = True
+                elif action_norm in ["EXIT_SHORT", "COVER"] and p.direction == "SHORT":
+                    should_close = True
+                    
+                if should_close:
+                    pnl = close_position_entry(p, price_val, db)
+                    trade_log.append(f"Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
         else:
             trade_log.append(f"Received exit signal for {symbol_norm} but no open position existed")
             
