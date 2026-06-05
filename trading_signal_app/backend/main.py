@@ -100,42 +100,56 @@ def get_ist_time() -> datetime:
 
 import re
 
+MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+}
+
 def parse_option_symbol(symbol: str) -> dict:
     s = symbol.upper().strip()
     if ":" in s:
         s = s.split(":")[-1]
         
-    # Match standard TV format: e.g. BANKNIFTY260625C54400
-    match_tv = re.match(r'^([A-Z]+)(\d{6})([CP])(\d+)$', s)
-    if match_tv:
-        underlying = match_tv.group(1)
-        expiry = match_tv.group(2)
-        opt_type_char = match_tv.group(3)
-        strike = int(match_tv.group(4))
-        
-        if underlying in ["BNF", "BANKNIFTY"]:
-            underlying = "BANKNIFTY"
-        elif underlying in ["NIFTY"]:
-            underlying = "NIFTY"
-        elif underlying in ["BSX", "SENSEX"]:
-            underlying = "SENSEX"
-            
-        opt_type = "CE" if opt_type_char == "C" else "PE"
-        return {
-            "is_option": True,
-            "underlying": underlying,
-            "expiry": expiry,
-            "strike": strike,
-            "opt_type": opt_type,
-            "formatted_symbol": f"{underlying} {strike} {opt_type}"
-        }
-        
-    # Match space-separated format: e.g. BANKNIFTY 54400 CE
-    match_space = re.match(r'^([A-Z]+)\s+(\d+)\s+(CE|PE)$', s)
+    # Format 1: Space separated with explicit expiry e.g. NIFTY 09JUN26 23500 CE
+    match_space = re.match(r'^([A-Z]+)\s+([0-9A-Z]{6,7})\s+(\d+)\s+(CE|PE)$', s)
     if match_space:
         underlying = match_space.group(1)
-        strike = int(match_space.group(2))
-        opt_type = match_space.group(3)
+        expiry_str = match_space.group(2)
+        strike = int(match_space.group(3))
+        opt_type = match_space.group(4)
+        
+        # Parse expiry date
+        expiry_date = None
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
+        except Exception:
+            try:
+                expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
+            except Exception:
+                pass
+                
+        if underlying in ["BNF", "BANKNIFTY"]:
+            underlying = "BANKNIFTY"
+        elif underlying in ["NIFTY"]:
+            underlying = "NIFTY"
+        elif underlying in ["BSX", "SENSEX"]:
+            underlying = "SENSEX"
+            
+        return {
+            "is_option": True,
+            "underlying": underlying,
+            "expiry_date": expiry_date,
+            "strike": strike,
+            "opt_type": opt_type,
+            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
+        }
+        
+    # Format 2: Space separated without expiry (fallback ATM calculation) e.g. BANKNIFTY 54400 CE
+    match_no_expiry = re.match(r'^([A-Z]+)\s+(\d+)\s+(CE|PE)$', s)
+    if match_no_expiry:
+        underlying = match_no_expiry.group(1)
+        strike = int(match_no_expiry.group(2))
+        opt_type = match_no_expiry.group(3)
         
         if underlying in ["BNF", "BANKNIFTY"]:
             underlying = "BANKNIFTY"
@@ -147,12 +161,90 @@ def parse_option_symbol(symbol: str) -> dict:
         return {
             "is_option": True,
             "underlying": underlying,
-            "expiry": None,
+            "expiry_date": None,
             "strike": strike,
             "opt_type": opt_type,
             "formatted_symbol": f"{underlying} {strike} {opt_type}"
         }
+
+    # Format 3: NSE compact format e.g. NIFTY09JUN26C23500 or BANKNIFTY260625C54400
+    match_nse = re.match(r'^([A-Z]+)([0-9A-Z]{6,7})([CP])(\d+)$', s)
+    if match_nse:
+        underlying = match_nse.group(1)
+        expiry_str = match_nse.group(2)
+        opt_char = match_nse.group(3)
+        strike = int(match_nse.group(4))
         
+        expiry_date = None
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
+        except Exception:
+            try:
+                expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
+            except Exception:
+                pass
+                
+        if underlying in ["BNF", "BANKNIFTY"]:
+            underlying = "BANKNIFTY"
+        elif underlying in ["NIFTY"]:
+            underlying = "NIFTY"
+        elif underlying in ["BSX", "SENSEX"]:
+            underlying = "SENSEX"
+            
+        opt_type = "CE" if opt_char == "C" else "PE"
+        return {
+            "is_option": True,
+            "underlying": underlying,
+            "expiry_date": expiry_date,
+            "strike": strike,
+            "opt_type": opt_type,
+            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
+        }
+        
+    # Format 4: BSE compact format e.g. SENSEX2660474800CE
+    match_bse = re.match(r'^([A-Z]+)(\d{2})(10|11|12|[1-9]|[OND])(\d{2})(\d+)(CE|PE)$', s)
+    if match_bse:
+        underlying = match_bse.group(1)
+        year_str = match_bse.group(2)
+        month_str = match_bse.group(3)
+        day_str = match_bse.group(4)
+        strike = int(match_bse.group(5))
+        opt_type = match_bse.group(6)
+        
+        # Parse expiry date
+        year = 2000 + int(year_str)
+        day = int(day_str)
+        
+        if month_str.isdigit():
+            month = int(month_str)
+        else:
+            m_char = month_str.upper()
+            if m_char == "O": month = 10
+            elif m_char == "N": month = 11
+            elif m_char == "D": month = 12
+            else: month = 1
+            
+        try:
+            expiry_date = date(year, month, day)
+        except Exception:
+            expiry_date = None
+            
+        if underlying in ["BNF", "BANKNIFTY"]:
+            underlying = "BANKNIFTY"
+        elif underlying in ["NIFTY"]:
+            underlying = "NIFTY"
+        elif underlying in ["BSX", "SENSEX"]:
+            underlying = "SENSEX"
+            
+        return {
+            "is_option": True,
+            "underlying": underlying,
+            "expiry_date": expiry_date,
+            "strike": strike,
+            "opt_type": opt_type,
+            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
+        }
+
     return {"is_option": False}
 
 def get_next_weekly_expiry(ist_now: datetime, expiry_weekday: int) -> date:
@@ -164,17 +256,17 @@ def get_next_weekly_expiry(ist_now: datetime, expiry_weekday: int) -> date:
             days_ahead = 7
     return (ist_now + timedelta(days=days_ahead)).date()
 
-def get_next_monthly_expiry(ist_now: datetime) -> date:
-    def last_thursday_of_month(year, month):
-        if month == 12:
-            last_day = date(year + 1, 1, 1) - timedelta(days=1)
-        else:
-            last_day = date(year, month + 1, 1) - timedelta(days=1)
-        while last_day.weekday() != 3:
-            last_day -= timedelta(days=1)
-        return last_day
+def get_last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        last_day = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = date(year, month + 1, 1) - timedelta(days=1)
+    while last_day.weekday() != weekday:
+        last_day -= timedelta(days=1)
+    return last_day
 
-    curr_month_expiry = last_thursday_of_month(ist_now.year, ist_now.month)
+def get_next_monthly_expiry(ist_now: datetime, weekday: int = 1) -> date:
+    curr_month_expiry = get_last_weekday_of_month(ist_now.year, ist_now.month, weekday)
     is_today_expiry = ist_now.date() == curr_month_expiry
     is_past_expiry = ist_now.date() > curr_month_expiry or (is_today_expiry and ist_now.time() > time(15, 30))
     
@@ -185,19 +277,20 @@ def get_next_monthly_expiry(ist_now: datetime) -> date:
         else:
             next_year = ist_now.year
             next_month = ist_now.month + 1
-        return last_thursday_of_month(next_year, next_month)
+        return get_last_weekday_of_month(next_year, next_month, weekday)
     return curr_month_expiry
 
-def get_time_to_expiry_years(underlying: str) -> float:
+def get_time_to_expiry_years(underlying: str, expiry_date: Optional[date] = None) -> float:
     ist_now = get_ist_time()
-    if underlying == "BANKNIFTY":
-        expiry_date = get_next_monthly_expiry(ist_now)
-    elif underlying == "NIFTY":
-        expiry_date = get_next_weekly_expiry(ist_now, 3)
-    elif underlying == "SENSEX":
-        expiry_date = get_next_weekly_expiry(ist_now, 4)
-    else:
-        expiry_date = get_next_weekly_expiry(ist_now, 3)
+    if expiry_date is None:
+        if underlying == "BANKNIFTY":
+            expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+        elif underlying == "NIFTY":
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        elif underlying == "SENSEX":
+            expiry_date = get_next_weekly_expiry(ist_now, 3)
+        else:
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
         
     expiry_datetime = datetime.combine(expiry_date, time(15, 30))
     diff = expiry_datetime - ist_now
@@ -225,13 +318,13 @@ def black_scholes_option_price(S: float, K: float, T: float, r: float, sigma: fl
         price = K * math.exp(-r * T) * N(-d2) - S * N(-d1)
     return price
 
-def calculate_option_price_bs(underlying: str, strike: float, opt_type: str, live_underlying: float) -> float:
-    T = get_time_to_expiry_years(underlying)
+def calculate_option_price_bs(underlying: str, strike: float, opt_type: str, live_underlying: float, expiry_date: Optional[date] = None) -> float:
+    T = get_time_to_expiry_years(underlying, expiry_date)
     r = 0.07
     if underlying == "BANKNIFTY":
         sigma = 0.19
     elif underlying in ["NIFTY", "SENSEX"]:
-        sigma = 0.12
+        sigma = 0.15
     else:
         sigma = 0.15
     price = black_scholes_option_price(S=live_underlying, K=strike, T=T, r=r, sigma=sigma, option_type=opt_type)
@@ -271,26 +364,24 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def extract_strike_from_symbol(symbol: str) -> Optional[float]:
-    parts = symbol.split()
-    if len(parts) >= 3:
-        try:
-            return float(parts[1])
-        except ValueError:
-            pass
+    parse_res = parse_option_symbol(symbol)
+    if parse_res.get("is_option"):
+        return float(parse_res["strike"])
     return None
 
 def close_position_entry(pos: Position, index_exit_price: float, db: Session) -> float:
-    parts = pos.symbol.split()
-    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    parse_res = parse_option_symbol(pos.symbol)
     
-    if is_option:
-        underlying = parts[0]
-        opt_type = parts[-1]
-        strike = float(parts[1])
+    if parse_res.get("is_option"):
+        underlying = parse_res["underlying"]
+        opt_type = parse_res["opt_type"]
+        strike = parse_res["strike"]
+        expiry_date = parse_res.get("expiry_date")
+        
         if index_exit_price > 0 and index_exit_price < 0.2 * strike:
             exit_price = index_exit_price
         else:
-            exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price)
+            exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price, expiry_date=expiry_date)
     else:
         exit_price = index_exit_price
         
@@ -616,6 +707,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         opt_symbol = parse_res["formatted_symbol"]
         opt_strike = parse_res["strike"]
         opt_type = parse_res["opt_type"]
+        expiry_date = parse_res.get("expiry_date")
         
         # If the price in payload is at the scale of an option premium
         if price_val > 0 and price_val < 0.2 * opt_strike:
@@ -623,7 +715,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         else:
             # Price is index price or 0. Fetch index price and calculate BS premium
             index_p = price_val if price_val > 0 else (get_live_market_price(underlying_norm) or opt_strike)
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, index_p)
+            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, index_p, expiry_date=expiry_date)
             price_val = index_p
     elif has_options and price_val > 0:
         step = 50 if underlying_norm == "NIFTY" else 100
@@ -635,8 +727,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             opt_type = "PE"
                 
         if opt_type:
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val)
-            opt_symbol = f"{underlying_norm} {opt_strike} {opt_type}"
+            # Determine expiry date
+            if underlying_norm == "BANKNIFTY":
+                expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+            elif underlying_norm == "NIFTY":
+                expiry_date = get_next_weekly_expiry(ist_now, 1)
+            elif underlying_norm == "SENSEX":
+                expiry_date = get_next_weekly_expiry(ist_now, 3)
+            else:
+                expiry_date = get_next_weekly_expiry(ist_now, 1)
+                
+            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
+            opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
     
     # Save signal in database in IST
     signal_entry = Signal(
@@ -949,13 +1051,13 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
     s_upper = symbol.upper().strip()
     
     # 1. Detect if the symbol is an Option contract
-    parts = symbol.split()
-    is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
+    parse_res = parse_option_symbol(symbol)
     
-    if is_option:
-        underlying = parts[0]
-        opt_type = parts[-1]
-        strike = float(parts[1])
+    if parse_res.get("is_option"):
+        underlying = parse_res["underlying"]
+        opt_type = parse_res["opt_type"]
+        strike = float(parse_res["strike"])
+        expiry_date = parse_res.get("expiry_date")
         
         # Get live underlying index price
         live_underlying = get_live_market_price(underlying)
@@ -964,7 +1066,7 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
             live_underlying = latest_signal.price if latest_signal else strike
             
-        current_premium = calculate_option_price_bs(underlying, strike, opt_type, live_underlying)
+        current_premium = calculate_option_price_bs(underlying, strike, opt_type, live_underlying, expiry_date=expiry_date)
         return round(max(1.0, current_premium), 2)
         
     # 2. Standard future/equity/crypto price resolution
@@ -1328,9 +1430,21 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         underlying_price = get_live_market_price(signal.symbol) or signal.price
         opt_strike = int(round(underlying_price / step) * step)
         opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
-        trade_symbol = f"{signal.symbol} {opt_strike} {opt_type}"
         
-        entry_price = calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price)
+        # Determine expiry date
+        ist_now = get_ist_time()
+        if sym_upper == "BANKNIFTY":
+            expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+        elif sym_upper == "NIFTY":
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        elif sym_upper == "SENSEX":
+            expiry_date = get_next_weekly_expiry(ist_now, 3)
+        else:
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+            
+        trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
+        
+        entry_price = calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date)
         direction = "LONG"
     else:
         trade_symbol = signal.symbol
