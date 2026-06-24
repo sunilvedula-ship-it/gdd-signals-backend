@@ -3,13 +3,17 @@ import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator
 import { BACKEND_URL } from '../config';
 
 
-export default function ConsentScreen() {
+export default function ConsentScreen({ session }) {
   const [consentSigned, setConsentSigned] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const fetchConsent = async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/api/consent`);
+      const headers = {};
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+      const response = await fetch(`${BACKEND_URL}/api/consent`, { headers });
       const data = await response.json();
       setConsentSigned(data.consent_signed);
     } catch (error) {
@@ -22,9 +26,13 @@ export default function ConsentScreen() {
   const signConsent = async () => {
     setLoading(true);
     try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
       const response = await fetch(`${BACKEND_URL}/api/consent`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ agreement_version: "v1.0" })
       });
       const data = await response.json();

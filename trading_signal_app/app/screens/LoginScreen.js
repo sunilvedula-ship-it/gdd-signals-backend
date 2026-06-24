@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { StyleSheet, View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView } from 'react-native';
+import { StyleSheet, View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, Image } from 'react-native';
 import { supabase } from '../supabase';
 
 export default function LoginScreen() {
@@ -63,8 +63,12 @@ export default function LoginScreen() {
     >
       <ScrollView contentContainerStyle={styles.scrollContent}>
         <View style={styles.header}>
-          <Text style={styles.logoEmoji}>⚡</Text>
-          <Text style={styles.title}>GDD Signals</Text>
+          <Image 
+            source={require('../assets/logo.png')} 
+            style={styles.logo} 
+            resizeMode="contain" 
+          />
+          <Text style={styles.title}>SKI Analytics</Text>
           <Text style={styles.subtitle}>Automated Trading & Real-Time Signals</Text>
         </View>
 
@@ -157,9 +161,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 32,
   },
-  logoEmoji: {
-    fontSize: 48,
-    marginBottom: 12,
+  logo: {
+    width: 150,
+    height: 150,
+    marginBottom: 16,
   },
   title: {
     fontSize: 28,

@@ -4,7 +4,7 @@ import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
 
-export default function SettingsScreen() {
+export default function SettingsScreen({ session }) {
   const [brokers, setBrokers] = useState([]);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
@@ -32,9 +32,13 @@ export default function SettingsScreen() {
   const executePurge = async () => {
     setLoading(true);
     try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
       const response = await fetch(`${BACKEND_URL}/api/admin/purge-test-data`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers
       });
       const data = await response.json();
       if (response.ok) {
@@ -51,7 +55,11 @@ export default function SettingsScreen() {
 
   const fetchCredentials = async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/api/credentials`);
+      const headers = {};
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+      const response = await fetch(`${BACKEND_URL}/api/credentials`, { headers });
       const data = await response.json();
       setBrokers(data.brokers);
     } catch (error) {
@@ -68,9 +76,13 @@ export default function SettingsScreen() {
     }
     setLoading(true);
     try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
       await fetch(`${BACKEND_URL}/api/credentials`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           broker_id: 'flattrade',
           api_key: apiKey,
@@ -91,7 +103,14 @@ export default function SettingsScreen() {
   const deleteCredentials = async (brokerId) => {
     setLoading(true);
     try {
-      await fetch(`${BACKEND_URL}/api/credentials/${brokerId}`, { method: 'DELETE' });
+      const headers = {};
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+      await fetch(`${BACKEND_URL}/api/credentials/${brokerId}`, {
+        method: 'DELETE',
+        headers
+      });
       fetchCredentials();
     } catch (error) {
       console.error("Error deleting credentials:", error);

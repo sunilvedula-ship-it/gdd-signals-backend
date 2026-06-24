@@ -37,6 +37,7 @@ class User(Base):
     __tablename__ = 'users'
     
     id = Column(Integer, primary_key=True, index=True)
+    supabase_uid = Column(String, unique=True, index=True, nullable=True)
     email = Column(String, unique=True, index=True)
     phone = Column(String, unique=True, index=True)
     name = Column(String)
@@ -44,6 +45,7 @@ class User(Base):
     trial_start = Column(DateTime, default=datetime.utcnow)
     trial_end = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
+    muted_symbols = Column(String, default="")  # comma-separated muted symbols
 
 class Signal(Base):
     __tablename__ = 'signals'
@@ -61,6 +63,7 @@ class Position(Base):
     __tablename__ = 'positions'
     
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), default=1)
     symbol = Column(String, index=True)
     direction = Column(String)  # LONG, SHORT
     qty = Column(Float)
@@ -88,7 +91,8 @@ class BrokerCredential(Base):
     __tablename__ = 'broker_credentials'
     
     id = Column(Integer, primary_key=True, index=True)
-    broker_id = Column(String, unique=True, index=True)  # flattrade, zerodha, delta_exchange, etc.
+    user_id = Column(Integer, ForeignKey('users.id'), default=1)
+    broker_id = Column(String, index=True)  # flattrade, zerodha, delta_exchange, etc.
     api_key = Column(String)
     api_secret = Column(String)
     extra_fields = Column(String)  # JSON string for extra fields (client_id, consumer_key, etc.)
@@ -96,18 +100,62 @@ class BrokerCredential(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
-    # Automatically add signal_id column to positions table if it does not exist
     from sqlalchemy import text
     db = SessionLocal()
     try:
-        if "postgresql" in DATABASE_URL:
-            db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS signal_id INTEGER;"))
-        else:
-            db.execute(text("ALTER TABLE positions ADD COLUMN signal_id INTEGER;"))
-        db.commit()
-        print("[DB] Successfully verified/added signal_id column to positions table.")
+        # Migrate user_id to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS user_id INTEGER DEFAULT 1;"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN user_id INTEGER DEFAULT 1;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate signal_id to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS signal_id INTEGER;"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN signal_id INTEGER;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate user_id to broker_credentials table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE broker_credentials ADD COLUMN IF NOT EXISTS user_id INTEGER DEFAULT 1;"))
+            else:
+                db.execute(text("ALTER TABLE broker_credentials ADD COLUMN user_id INTEGER DEFAULT 1;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate supabase_uid and muted_symbols to users table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS supabase_uid VARCHAR(255);"))
+                db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_symbols TEXT DEFAULT '';"))
+            else:
+                db.execute(text("ALTER TABLE users ADD COLUMN supabase_uid VARCHAR(255);"))
+                db.execute(text("ALTER TABLE users ADD COLUMN muted_symbols TEXT DEFAULT '';"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Drop unique constraint index on broker_credentials.broker_id if it exists
+        try:
+            db.execute(text("DROP INDEX IF EXISTS ix_broker_credentials_broker_id;"))
+            db.execute(text("CREATE INDEX ix_broker_credentials_broker_id ON broker_credentials (broker_id);"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        print("[DB] Successfully verified and completed all database migrations.")
     except Exception as e:
-        print(f"[DB] Migration note: {e}")
+        print(f"[DB] Migration error: {e}")
         pass
     finally:
         db.close()

@@ -1,10 +1,16 @@
 {
   "expo": {
-    "name": "GDD Signals",
-    "slug": "gdd-signals",
+    "name": "SKI Analytics",
+    "slug": "ski-analytics",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/logo.png",
     "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0a0e17"
+    },
     "assetBundlePatterns": [
       "**/*"
     ],

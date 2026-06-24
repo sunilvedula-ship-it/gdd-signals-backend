@@ -44,8 +44,9 @@ def deobfuscate(encoded):
 class AppCredentialsManager:
     """Manages credentials utilizing SQLite storage instead of a flat file, keeping same obfuscation."""
     
-    def __init__(self, db_session):
+    def __init__(self, db_session, user_id=1):
         self.db = db_session
+        self.user_id = user_id
         from backend.database import BrokerCredential
         self.model = BrokerCredential
         
@@ -57,7 +58,11 @@ class AppCredentialsManager:
         enc_api_secret = obfuscate(api_secret)
         enc_extra = obfuscate(extra_json)
         
-        cred = self.db.query(self.model).filter(self.model.broker_id == broker_id).first()
+        cred = self.db.query(self.model).filter(
+            self.model.broker_id == broker_id,
+            self.model.user_id == self.user_id
+        ).first()
+        
         if cred:
             cred.api_key = enc_api_key
             cred.api_secret = enc_api_secret
@@ -65,6 +70,7 @@ class AppCredentialsManager:
             cred.updated_at = datetime.utcnow()
         else:
             cred = self.model(
+                user_id=self.user_id,
                 broker_id=broker_id,
                 api_key=enc_api_key,
                 api_secret=enc_api_secret,
@@ -77,7 +83,10 @@ class AppCredentialsManager:
         return True
 
     def load_credentials(self, broker_id):
-        cred = self.db.query(self.model).filter(self.model.broker_id == broker_id).first()
+        cred = self.db.query(self.model).filter(
+            self.model.broker_id == broker_id,
+            self.model.user_id == self.user_id
+        ).first()
         if not cred:
             return None
         try:
@@ -92,7 +101,10 @@ class AppCredentialsManager:
             return None
 
     def delete_credentials(self, broker_id):
-        cred = self.db.query(self.model).filter(self.model.broker_id == broker_id).first()
+        cred = self.db.query(self.model).filter(
+            self.model.broker_id == broker_id,
+            self.model.user_id == self.user_id
+        ).first()
         if cred:
             self.db.delete(cred)
             self.db.commit()
@@ -100,7 +112,10 @@ class AppCredentialsManager:
         return False
 
     def has_credentials(self, broker_id):
-        cred = self.db.query(self.model).filter(self.model.broker_id == broker_id).first()
+        cred = self.db.query(self.model).filter(
+            self.model.broker_id == broker_id,
+            self.model.user_id == self.user_id
+        ).first()
         return cred is not None
 
     def get_masked_info(self, broker_id):

@@ -81,7 +81,161 @@ def startup_event():
         user.trial_end = get_ist_time() + timedelta(days=7)
         db.add(user)
         db.commit()
+    
+    # Auto-insert daily consent for User 1 to make local webhook simulator work out-of-the-box
+    ist_now = get_ist_time()
+    today_str = ist_now.date().isoformat()
+    if not db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.user_id == 1).first():
+        consent = DailyConsent(
+            date=today_str,
+            agreement_text_version="v1.0",
+            consent_given=True,
+            timestamp=ist_now,
+            user_id=1
+        )
+        db.add(consent)
+        db.commit()
+        
     db.close()
+
+# Supabase Credentials & Token Validation Helpers
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://lgedxrswafjsvjcoduvw.supabase.co")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxnZWR4cnN3YWZqc3ZqY29kdXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk1MjczMDYsImV4cCI6MjA5NTEwMzMwNn0.08tMMK4TGbfeLZKHYteqtU2EYR4K5PwAJmgeA-xqrXk")
+
+def get_user_from_token(token: str) -> Optional[dict]:
+    import urllib.request
+    import json
+    
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "apikey": SUPABASE_ANON_KEY
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[Auth Error] Failed to validate token with Supabase: {e}")
+        return None
+
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    auth_header = request.headers.get("Authorization")
+    token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+        
+    if not token:
+        # Fallback to sandbox user (User ID 1) for local web simulator
+        user = db.query(User).filter(User.id == 1).first()
+        if not user:
+            user = User(
+                id=1,
+                email="sandbox@example.com",
+                phone="+919999999999",
+                name="Sandbox User",
+                subscription_status="active"
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return user
+        
+    # Verify token
+    user_info = get_user_from_token(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid session token. Please log in again.")
+        
+    supabase_uid = user_info.get("id")
+    email = user_info.get("email")
+    phone = user_info.get("phone")
+    name = user_info.get("user_metadata", {}).get("name", email or phone or "User")
+    
+    user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
+    if not user:
+        # Check if user with same phone or email exists but has no supabase_uid
+        user = db.query(User).filter(
+            (User.phone == phone) | (User.email == email)
+        ).first()
+        if user:
+            user.supabase_uid = supabase_uid
+        else:
+            user = User(
+                supabase_uid=supabase_uid,
+                email=email,
+                phone=phone,
+                name=name,
+                subscription_status="active"
+            )
+            db.add(user)
+        db.commit()
+        db.refresh(user)
+        
+    return user
+
+def is_symbol_muted(symbol: str, muted_symbols_str: str) -> bool:
+    if not muted_symbols_str:
+        return False
+    muted_list = [s.strip().upper() for s in muted_symbols_str.split(",") if s.strip()]
+    sym_upper = symbol.upper().strip()
+    
+    if sym_upper in muted_list:
+        return True
+        
+    for muted in muted_list:
+        if muted in sym_upper:
+            return True
+            
+    return False
+
+# Settings endpoints
+class MuteRequest(BaseModel):
+    symbol: str
+    mute: bool
+
+@app.get("/api/user/settings")
+def get_user_settings(user: User = Depends(get_current_user)):
+    muted_list = [s.strip() for s in user.muted_symbols.split(",") if s.strip()] if user.muted_symbols else []
+    return {"muted_symbols": muted_list}
+
+@app.post("/api/user/settings/mute")
+def toggle_mute_symbol(req: MuteRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    muted_list = [s.strip() for s in user.muted_symbols.split(",") if s.strip()] if user.muted_symbols else []
+    # Clean exchange prefixes/suffixes like normalize_symbol does, or use raw input
+    sym = req.symbol.upper().strip()
+    if ":" in sym:
+        sym = sym.split(":")[-1]
+    if sym.endswith("1!"):
+        sym = sym[:-2]
+    elif sym.endswith("!"):
+        sym = sym[:-1]
+        
+    if "XAUUSD" in sym or "XAU" in sym or "GOLD" in sym:
+        sym = "GOLD"
+    elif "SILVER" in sym:
+        sym = "SILVER"
+    elif "BANKNIFTY" in sym or "BNF" in sym:
+        sym = "BANKNIFTY"
+    elif "NIFTY" in sym:
+        sym = "NIFTY"
+    elif "SENSEX" in sym or "BSX" in sym:
+        sym = "SENSEX"
+    elif "CRUDE" in sym:
+        sym = "CRUDEOIL"
+        
+    if req.mute:
+        if sym not in muted_list:
+            muted_list.append(sym)
+    else:
+        if sym in muted_list:
+            muted_list.remove(sym)
+            
+    user.muted_symbols = ",".join(muted_list)
+    db.commit()
+    return {"status": "success", "muted_symbols": muted_list}
+
 
 # WebSocket endpoint for real-time updates
 @app.websocket("/ws")
@@ -397,8 +551,9 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     return pos.pnl
 
 
-def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session) -> Position:
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1) -> Position:
     new_pos = Position(
+        user_id=user_id,
         symbol=symbol,
         direction=direction,
         qty=qty,
@@ -675,71 +830,6 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         underlying_norm = "SENSEX"
         
     # Check for open positions on this symbol or its options
-    open_positions = db.query(Position).filter(
-        (Position.symbol == symbol_norm) | 
-        (Position.symbol == underlying_norm) |
-        (Position.symbol.like(f"{symbol_norm} %")) |
-        (Position.symbol.like(f"{underlying_norm} %")),
-        Position.status == "OPEN"
-    ).all()
-    
-    open_pos_future = next((p for p in open_positions if p.symbol == symbol_norm), None)
-    
-    # Contextual Exit Action Labels (SELL & COVER instead of EXIT)
-    if action_norm == "EXIT" and open_pos_future:
-        if open_pos_future.direction == "LONG":
-            action_norm = "SELL"
-        else:
-            action_norm = "COVER"
-            
-    # Calculate Option details (At-The-Money CE/PE option contract)
-    has_options = underlying_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
-    opt_strike = None
-    opt_symbol = None
-    opt_premium = None
-    opt_type = None
-    
-    # Check if the incoming signal is directly on an Option contract
-    parse_res = parse_option_symbol(symbol_norm)
-    is_option_signal = parse_res.get("is_option", False)
-    
-    if is_option_signal:
-        opt_symbol = parse_res["formatted_symbol"]
-        opt_strike = parse_res["strike"]
-        opt_type = parse_res["opt_type"]
-        expiry_date = parse_res.get("expiry_date")
-        
-        # If the price in payload is at the scale of an option premium
-        if price_val > 0 and price_val < 0.2 * opt_strike:
-            opt_premium = price_val
-        else:
-            # Price is index price or 0. Fetch index price and calculate BS premium
-            index_p = price_val if price_val > 0 else (get_live_market_price(underlying_norm) or opt_strike)
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, index_p, expiry_date=expiry_date)
-            price_val = index_p
-    elif has_options and price_val > 0:
-        step = 50 if underlying_norm == "NIFTY" else 100
-        opt_strike = int(round(price_val / step) * step)
-        
-        if action_norm in ["BUY", "LONG"]:
-            opt_type = "CE"
-        elif action_norm in ["SELL", "SHORT"]:
-            opt_type = "PE"
-                
-        if opt_type:
-            # Determine expiry date
-            if underlying_norm == "BANKNIFTY":
-                expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
-            elif underlying_norm == "NIFTY":
-                expiry_date = get_next_weekly_expiry(ist_now, 1)
-            elif underlying_norm == "SENSEX":
-                expiry_date = get_next_weekly_expiry(ist_now, 3)
-            else:
-                expiry_date = get_next_weekly_expiry(ist_now, 1)
-                
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
-            opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-    
     # Save signal in database in IST
     signal_entry = Signal(
         symbol=symbol_norm,
@@ -755,91 +845,124 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     
     trade_log = []
     
-    # Execution Logic
-    if action_norm in ["BUY", "LONG"]:
-        is_explicit_long_entry = (
-            raw_action is None or
-            str(raw_action).lower() in ["long", "entry_long", "entry"] or
-            "LONG" in str(raw_key).upper() or
-            "LONG" in str(raw_dir).upper() or
-            (str(raw_action).lower() == "buy" and not open_pos_future)
-        )
-        
-        if open_positions:
-            for p in open_positions:
-                pnl = close_position_entry(p, price_val, db)
-                trade_log.append(f"Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+    # 5. Process execution for each user who gave consent for today
+    today_str = ist_now.date().isoformat()
+    consents = db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.consent_given == True).all()
+    
+    for consent in consents:
+        user = db.query(User).filter(User.id == consent.user_id).first()
+        if not user:
+            continue
             
-            if not is_explicit_long_entry:
-                trade_log.append(f"Covered SHORT position on {symbol_norm} (flat)")
-                
-        if not open_positions or is_explicit_long_entry:
-            if is_option_signal:
-                qty = calculate_trade_qty(underlying_norm)
-                open_position_entry(symbol_norm, "LONG", opt_premium, qty, db)
-                trade_log.append(f"Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
-            else:
-                # A. Open Future position
-                qty = calculate_trade_qty(symbol_norm)
-                open_position_entry(symbol_norm, "LONG", price_val, qty, db)
-                trade_log.append(f"Opened Future LONG position for {symbol_norm} (Qty: {qty})")
-                
-                # B. Open Option position
-                if opt_symbol and opt_premium:
-                    open_position_entry(opt_symbol, "LONG", opt_premium, qty, db)
-                    trade_log.append(f"Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
-                
-    elif action_norm in ["SELL", "SHORT"]:
-        is_explicit_short_entry = (
-            raw_action is None or
-            str(raw_action).lower() in ["short", "entry_short", "entry"] or
-            "SHORT" in str(raw_key).upper() or
-            "SHORT" in str(raw_dir).upper() or
-            (str(raw_action).lower() == "sell" and not open_pos_future)
-        )
-        
-        if open_positions:
-            for p in open_positions:
-                pnl = close_position_entry(p, price_val, db)
-                trade_log.append(f"Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+        if is_symbol_muted(symbol_norm, user.muted_symbols):
+            print(f"[Webhook Skipped] Symbol {symbol_norm} is muted for User {user.id} ({user.name})")
+            continue
             
-            if not is_explicit_short_entry:
-                trade_log.append(f"Exited LONG position on {symbol_norm} (flat)")
-                
-        if not open_positions or is_explicit_short_entry:
-            if is_option_signal:
-                qty = calculate_trade_qty(underlying_norm)
-                open_position_entry(symbol_norm, "LONG", opt_premium, qty, db)
-                trade_log.append(f"Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
+        # Check for open positions on this symbol or its options for this user
+        user_open_positions = db.query(Position).filter(
+            Position.user_id == user.id,
+            ((Position.symbol == symbol_norm) | 
+             (Position.symbol == underlying_norm) |
+             (Position.symbol.like(f"{symbol_norm} %")) |
+             (Position.symbol.like(f"{underlying_norm} %"))),
+            Position.status == "OPEN"
+        ).all()
+        
+        open_pos_future = next((p for p in user_open_positions if p.symbol == symbol_norm), None)
+        
+        user_action = action_norm
+        # Contextual Exit Action Labels (SELL & COVER instead of EXIT)
+        if user_action == "EXIT" and open_pos_future:
+            if open_pos_future.direction == "LONG":
+                user_action = "SELL"
             else:
-                # A. Open Future position
-                qty = calculate_trade_qty(symbol_norm)
-                open_position_entry(symbol_norm, "SHORT", price_val, qty, db)
-                trade_log.append(f"Opened Future SHORT position for {symbol_norm} (Qty: {qty})")
+                user_action = "COVER"
                 
-                # B. Open Option position (PE Premium is bought, so position direction is LONG)
-                if opt_symbol and opt_premium:
-                    open_position_entry(opt_symbol, "LONG", opt_premium, qty, db)
-                    trade_log.append(f"Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
-                
-    elif action_norm in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
-        if open_positions:
-            for p in open_positions:
-                # Direction-aware exit check to prevent exit-ordering race conditions
-                should_close = False
-                if action_norm in ["EXIT", "CLOSE"]:
-                    should_close = True
-                elif action_norm == "EXIT_LONG" and p.direction == "LONG":
-                    should_close = True
-                elif action_norm in ["EXIT_SHORT", "COVER"] and p.direction == "SHORT":
-                    should_close = True
-                    
-                if should_close:
+        # Execution Logic for this user
+        if user_action in ["BUY", "LONG"]:
+            is_explicit_long_entry = (
+                raw_action is None or
+                str(raw_action).lower() in ["long", "entry_long", "entry"] or
+                "LONG" in str(raw_key).upper() or
+                "LONG" in str(raw_dir).upper() or
+                (str(raw_action).lower() == "buy" and not open_pos_future)
+            )
+            
+            if user_open_positions:
+                for p in user_open_positions:
                     pnl = close_position_entry(p, price_val, db)
-                    trade_log.append(f"Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
-        else:
-            trade_log.append(f"Received exit signal for {symbol_norm} but no open position existed")
+                    trade_log.append(f"User {user.id}: Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+                
+                if not is_explicit_long_entry:
+                    trade_log.append(f"User {user.id}: Covered SHORT position on {symbol_norm} (flat)")
+                    
+            if not user_open_positions or is_explicit_long_entry:
+                if is_option_signal:
+                    qty = calculate_trade_qty(underlying_norm)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id)
+                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                else:
+                    # A. Open Future position
+                    qty = calculate_trade_qty(symbol_norm)
+                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id)
+                    trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty})")
+                    
+                    # B. Open Option position
+                    if opt_symbol and opt_premium:
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                    
+        elif user_action in ["SELL", "SHORT"]:
+            is_explicit_short_entry = (
+                raw_action is None or
+                str(raw_action).lower() in ["short", "entry_short", "entry"] or
+                "SHORT" in str(raw_key).upper() or
+                "SHORT" in str(raw_dir).upper() or
+                (str(raw_action).lower() == "sell" and not open_pos_future)
+            )
             
+            if user_open_positions:
+                for p in user_open_positions:
+                    pnl = close_position_entry(p, price_val, db)
+                    trade_log.append(f"User {user.id}: Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+                
+                if not is_explicit_short_entry:
+                    trade_log.append(f"User {user.id}: Exited LONG position on {symbol_norm} (flat)")
+                    
+            if not user_open_positions or is_explicit_short_entry:
+                if is_option_signal:
+                    qty = calculate_trade_qty(underlying_norm)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id)
+                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                else:
+                    # A. Open Future position
+                    qty = calculate_trade_qty(symbol_norm)
+                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id)
+                    trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty})")
+                    
+                    # B. Open Option position (PE Premium is bought, so position direction is LONG)
+                    if opt_symbol and opt_premium:
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                    
+        elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
+            if user_open_positions:
+                for p in user_open_positions:
+                    # Direction-aware exit check to prevent exit-ordering race conditions
+                    should_close = False
+                    if user_action in ["EXIT", "CLOSE"]:
+                        should_close = True
+                    elif user_action == "EXIT_LONG" and p.direction == "LONG":
+                        should_close = True
+                    elif user_action in ["EXIT_SHORT", "COVER"] and p.direction == "SHORT":
+                        should_close = True
+                        
+                    if should_close:
+                        pnl = close_position_entry(p, price_val, db)
+                        trade_log.append(f"User {user.id}: Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
+            else:
+                trade_log.append(f"User {user.id}: Received exit signal for {symbol_norm} but no open position existed")
+                
     db.commit()
     
     # Broadcast signal and trades to all WS clients
@@ -854,17 +977,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             "source": signal_entry.source,
             "source_name": signal_entry.source_name
         },
-        "consent_signed": consent_signed,
+        "consent_signed": len(consents) > 0,
         "logs": trade_log
     }
     await manager.broadcast(json.dumps(ws_data))
     
-    return {"status": "success", "processed_signals": 1, "actions": trade_log, "consent_signed": consent_signed}
+    return {"status": "success", "processed_signals": len(consents), "actions": trade_log, "consent_signed": len(consents) > 0}
 
 
 @app.get("/api/signals")
-def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_db)):
+def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     signals = db.query(Signal).order_by(Signal.timestamp.desc()).limit(limit).all()
+    filtered_signals = [s for s in signals if not is_symbol_muted(s.symbol, user.muted_symbols)]
     return [{
         "id": s.id,
         "timestamp": s.timestamp.isoformat(),
@@ -873,7 +997,7 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "price": s.price,
         "source": s.source,
         "source_name": s.source_name
-    } for s in signals]
+    } for s in filtered_signals]
 
 def get_tradingview_price(symbol: str) -> Optional[float]:
     s = symbol.upper().strip()
@@ -1105,8 +1229,8 @@ def is_usd_asset(symbol: str) -> bool:
     return "USD" in s or "USDT" in s or s in ["BTC", "ETH", "SOL", "ADA", "XRP"]
 
 @app.get("/api/paper-trades")
-def get_paper_trades(db: Session = Depends(get_db)):
-    positions = db.query(Position).order_by(Position.entry_time.desc()).all()
+def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    positions = db.query(Position).filter(Position.user_id == user.id).order_by(Position.entry_time.desc()).all()
     
     # Calculate stats
     closed_positions = [p for p in positions if p.status == "CLOSED"]
@@ -1185,8 +1309,8 @@ def get_paper_trades(db: Session = Depends(get_db)):
     }
 
 @app.post("/api/paper-trades/manual-exit/{pos_id}")
-def manual_exit_position(pos_id: int, db: Session = Depends(get_db)):
-    pos = db.query(Position).filter(Position.id == pos_id, Position.status == "OPEN").first()
+def manual_exit_position(pos_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    pos = db.query(Position).filter(Position.id == pos_id, Position.user_id == user.id, Position.status == "OPEN").first()
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
     
@@ -1205,10 +1329,10 @@ def manual_exit_position(pos_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "pnl": pos.pnl}
 
 @app.get("/api/consent")
-def check_consent(db: Session = Depends(get_db)):
+def check_consent(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     ist_now = get_ist_time()
     today_str = ist_now.date().isoformat()
-    consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
+    consent = db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.user_id == user.id).first()
     return {
         "consent_signed": consent is not None and consent.consent_given,
         "date": today_str,
@@ -1216,10 +1340,10 @@ def check_consent(db: Session = Depends(get_db)):
     }
 
 @app.post("/api/consent")
-def sign_consent(req: ConsentRequest, db: Session = Depends(get_db)):
+def sign_consent(req: ConsentRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     ist_now = get_ist_time()
     today_str = ist_now.date().isoformat()
-    consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
+    consent = db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.user_id == user.id).first()
     if consent:
         consent.consent_given = True
         consent.timestamp = ist_now
@@ -1228,15 +1352,16 @@ def sign_consent(req: ConsentRequest, db: Session = Depends(get_db)):
             date=today_str,
             agreement_text_version=req.agreement_version,
             consent_given=True,
-            timestamp=ist_now
+            timestamp=ist_now,
+            user_id=user.id
         )
         db.add(consent)
     db.commit()
     return {"status": "success", "signed": True, "date": today_str}
 
 @app.get("/api/credentials")
-def get_credentials(db: Session = Depends(get_db)):
-    mgr = AppCredentialsManager(db)
+def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mgr = AppCredentialsManager(db, user_id=user.id)
     broker_list = []
     for broker in INDIAN_BROKERS:
         has = mgr.has_credentials(broker['id'])
@@ -1269,8 +1394,8 @@ def get_credentials(db: Session = Depends(get_db)):
     }
 
 @app.post("/api/credentials")
-def save_credentials(req: CredentialRequest, db: Session = Depends(get_db)):
-    mgr = AppCredentialsManager(db)
+def save_credentials(req: CredentialRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mgr = AppCredentialsManager(db, user_id=user.id)
     success = mgr.save_credentials(
         broker_id=req.broker_id,
         api_key=req.api_key,
@@ -1282,18 +1407,18 @@ def save_credentials(req: CredentialRequest, db: Session = Depends(get_db)):
     raise HTTPException(status_code=500, detail="Error saving credentials")
 
 @app.delete("/api/credentials/{broker_id}")
-def delete_credentials(broker_id: str, db: Session = Depends(get_db)):
-    mgr = AppCredentialsManager(db)
+def delete_credentials(broker_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mgr = AppCredentialsManager(db, user_id=user.id)
     if mgr.delete_credentials(broker_id):
         return {"status": "success", "broker_id": broker_id}
     raise HTTPException(status_code=404, detail="Credentials not found")
 
 @app.get("/api/user")
-def get_user_profile(db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == 1).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+def get_user_profile(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     trial_days_left = 5
+    if user.trial_end:
+        delta = user.trial_end - get_ist_time()
+        trial_days_left = max(0, delta.days)
     return {
         "name": user.name,
         "email": user.email,
@@ -1334,12 +1459,12 @@ def get_lot_size(symbol: str) -> int:
         return 100
 
 @app.get("/api/broker/status")
-def get_broker_status(db: Session = Depends(get_db)):
-    mgr = AppCredentialsManager(db)
+def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mgr = AppCredentialsManager(db, user_id=user.id)
     active_id = mgr.get_active_broker()
     
     # Calculate open positions combined live open P&L
-    positions = db.query(Position).filter(Position.status == "OPEN").all()
+    positions = db.query(Position).filter(Position.status == "OPEN", Position.user_id == user.id).all()
     combined_pnl = 0.0
     for p in positions:
         current_price = get_current_price(p.symbol, p.entry_price, db)
@@ -1370,7 +1495,7 @@ def get_broker_status(db: Session = Depends(get_db)):
         }
 
 @app.post("/api/broker/execute")
-def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)):
+def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
@@ -1396,12 +1521,14 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     if req.trade_type == "OPTION":
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
+            Position.user_id == user.id,
             (Position.symbol.like("% CE") | Position.symbol.like("% PE") | Position.symbol.like("%CE%") | Position.symbol.like("%PE%"))
         ).first()
     else:
         # FUTURE
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
+            Position.user_id == user.id,
             ~Position.symbol.like("% CE"),
             ~Position.symbol.like("% PE"),
             ~Position.symbol.like("%CE%"),
@@ -1453,6 +1580,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         
     # Create the position
     new_pos = Position(
+        user_id=user.id,
         symbol=trade_symbol,
         direction=direction,
         qty=qty,
@@ -1475,8 +1603,8 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     }
 
 @app.post("/api/broker/manual-exit/{pos_id}")
-def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db)):
-    pos = db.query(Position).filter(Position.id == pos_id, Position.status == "OPEN").first()
+def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    pos = db.query(Position).filter(Position.id == pos_id, Position.user_id == user.id, Position.status == "OPEN").first()
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
         
@@ -1494,16 +1622,15 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "pnl": pos.pnl}
 
 @app.post("/api/admin/purge-test-data")
-def purge_test_data(db: Session = Depends(get_db)):
+def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
-        num_positions = db.query(Position).delete()
-        num_signals = db.query(Signal).delete()
+        num_positions = db.query(Position).filter(Position.user_id == user.id).delete()
         db.commit()
         return {
             "status": "success",
             "purged_positions": num_positions,
-            "purged_signals": num_signals,
-            "detail": "Successfully cleared all database signals and positions."
+            "purged_signals": 0,
+            "detail": "Successfully cleared all user positions."
         }
     except Exception as e:
         db.rollback()

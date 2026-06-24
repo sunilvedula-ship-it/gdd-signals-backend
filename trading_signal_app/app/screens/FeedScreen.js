@@ -1,20 +1,51 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl } from 'react-native';
+import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity } from 'react-native';
 import { BACKEND_URL } from '../config';
 
 
-export default function FeedScreen() {
+export default function FeedScreen({ session }) {
   const [signals, setSignals] = useState([]);
+  const [brokerStatus, setBrokerStatus] = useState({ status: 'sandbox', broker_name: 'Sandbox Broker', balance: 1000000, mode: 'SANDBOX', combined_open_pnl: 0 });
+  const [positions, setPositions] = useState([]);
+  const [mutedSymbols, setMutedSymbols] = useState([]);
+  
+  const [selectedLots, setSelectedLots] = useState({});
+  const [selectedTradeTypes, setSelectedTradeTypes] = useState({});
+  const [selectedModes, setSelectedModes] = useState({});
+  const [submitting, setSubmitting] = useState({});
+  
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const fetchSignals = async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/api/signals`);
+      const headers = {};
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+      
+      const response = await fetch(`${BACKEND_URL}/api/signals`, { headers });
       const data = await response.json();
       setSignals(data);
+      
+      // Fetch broker account status
+      const brokerRes = await fetch(`${BACKEND_URL}/api/broker/status`, { headers });
+      const brokerData = await brokerRes.json();
+      setBrokerStatus(brokerData);
+      
+      // Fetch positions (to check active trade running on signal_id)
+      const positionsRes = await fetch(`${BACKEND_URL}/api/paper-trades`, { headers });
+      const positionsData = await positionsRes.json();
+      setPositions(positionsData.positions || []);
+
+      // Fetch settings for muted symbols
+      const settingsRes = await fetch(`${BACKEND_URL}/api/user/settings`, { headers });
+      if (settingsRes.ok) {
+        const settingsData = await settingsRes.json();
+        setMutedSymbols(settingsData.muted_symbols || []);
+      }
     } catch (error) {
-      console.error("Error loading signals:", error);
+      console.error("Error loading signals & broker info:", error);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -33,9 +64,114 @@ export default function FeedScreen() {
     fetchSignals();
   };
 
+  const getLotSize = (symbol) => {
+    const sym = (symbol || '').toUpperCase();
+    if (sym.includes('BANKNIFTY')) return 30;
+    if (sym.includes('NIFTY')) return 65;
+    if (sym.includes('SENSEX') || sym.includes('BSX')) return 20;
+    if (sym.includes('CRUDE')) return 100;
+    if (sym.includes('GOLD')) return 100;
+    if (sym.includes('WIPRO')) return 1500;
+    if (sym.includes('RELIANCE')) return 250;
+    if (sym.includes('TITAN')) return 375;
+    if (sym.includes('BAJFINSERV')) return 500;
+    if (sym.includes('ADANIPORTS')) return 625;
+    return 100; // default fallback
+  };
+
+  const isCryptoAsset = (symbol) => {
+    const sym = (symbol || '').toUpperCase();
+    return sym.includes('BTC') || sym.includes('ETH') || sym.includes('SOL') || sym.includes('USD') || sym.includes('USDT');
+  };
+
+  const handleExecuteOrder = async (signalId, symbol) => {
+    const lots = selectedLots[signalId] || 1;
+    const tradeType = selectedTradeTypes[signalId] || 'FUTURE';
+    const mode = selectedModes[signalId] || 'PAPER';
+    
+    setSubmitting(prev => ({ ...prev, [signalId]: true }));
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+      const response = await fetch(`${BACKEND_URL}/api/broker/execute`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          signal_id: signalId,
+          trade_type: tradeType,
+          mode: mode,
+          lots: lots
+        })
+      });
+      const resData = await response.json();
+      if (response.ok) {
+        alert(`Success: Order executed for ${resData.symbol}. Traded ${lots} Lots (${resData.qty} Qty) in ${resData.mode} mode!`);
+        fetchSignals();
+      } else {
+        alert(`Error: ${resData.detail || 'Order execution failed'}`);
+      }
+    } catch (error) {
+      alert(`Network error: ${error.message}`);
+    } finally {
+      setSubmitting(prev => ({ ...prev, [signalId]: false }));
+    }
+  };
+
+  const getNormalizedBaseSymbol = (symbol) => {
+    let sym = (symbol || '').toUpperCase().trim();
+    if (sym.includes(':')) {
+      sym = sym.split(':').pop();
+    }
+    const parts = sym.split(/\s+/);
+    if (parts.length >= 3 && ['CE', 'PE'].includes(parts[parts.length - 1])) {
+      sym = parts[0];
+    }
+    if (sym.endsWith('1!')) {
+      sym = sym.slice(0, -2);
+    } else if (sym.endsWith('!')) {
+      sym = sym.slice(0, -1);
+    }
+    if (sym.includes('XAU') || sym.includes('GOLD')) return 'GOLD';
+    if (sym.includes('SILVER')) return 'SILVER';
+    if (sym.includes('BANKNIFTY') || sym.includes('BNF')) return 'BANKNIFTY';
+    if (sym.includes('NIFTY')) return 'NIFTY';
+    if (sym.includes('SENSEX') || sym.includes('BSX')) return 'SENSEX';
+    if (sym.includes('CRUDE')) return 'CRUDEOIL';
+    return sym;
+  };
+
+  const handleToggleMute = async (symbol) => {
+    const sym = getNormalizedBaseSymbol(symbol);
+    const isCurrentlyMuted = mutedSymbols.includes(sym);
+    const newMuteStatus = !isCurrentlyMuted;
+
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) {
+        headers['Authorization'] = `Bearer ${session.access_token}`;
+      }
+
+      const response = await fetch(`${BACKEND_URL}/api/user/settings/mute`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ symbol: sym, mute: newMuteStatus })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setMutedSymbols(data.muted_symbols || []);
+      } else {
+        alert(`Error toggling mute: ${data.detail || 'Request failed'}`);
+      }
+    } catch (error) {
+      alert(`Network error toggling mute: ${error.message}`);
+    }
+  };
+
   const renderItem = ({ item }) => {
     const isLong = item.action === 'LONG' || item.action === 'BUY';
-    const isShort = item.action === 'SHORT' || item.action === 'SELL';
+    const isShort = item.action === 'SHORT'; // Sell and Cover are exits, do not allow short entry on Sell
     
     let cardStyle = styles.cardNeutral;
     let badgeStyle = styles.badgeNeutral;
@@ -47,24 +183,162 @@ export default function FeedScreen() {
       badgeStyle = styles.badgeShort;
     }
 
+    const symUpper = (item.symbol || '').toUpperCase();
+    const isUSD = symUpper.includes('USD') || symUpper.includes('USDT') || ['BTC', 'ETH', 'SOL', 'ADA', 'XRP'].includes(symUpper);
+    const currencySymbol = isUSD ? '$' : '₹';
+    const locale = isUSD ? 'en-US' : 'en-IN';
+
+    // Lot execution panel states
+    const lots = selectedLots[item.id] || 1;
+    const tradeType = selectedTradeTypes[item.id] || 'FUTURE';
+    const mode = selectedModes[item.id] || 'PAPER';
+    const isCrypto = isCryptoAsset(item.symbol);
+    const lotSizeVal = getLotSize(item.symbol);
+    const totalQty = isCrypto ? lots : (lots * lotSizeVal);
+    const qtyLabel = isCrypto ? `${totalQty} Qty` : `${lots} Lots (${totalQty} Qty)`;
+
+    // Option symbol identification
+    const isOptionSymbol = (sym) => (sym || '').includes(' CE') || (sym || '').includes(' PE');
+    const existingFuturePos = positions.find(pos => pos.signal_id === item.id && pos.status === 'OPEN' && !isOptionSymbol(pos.symbol));
+    const existingOptionPos = positions.find(pos => pos.signal_id === item.id && pos.status === 'OPEN' && isOptionSymbol(pos.symbol));
+    
+    const currentTypePos = tradeType === 'FUTURE' ? existingFuturePos : existingOptionPos;
+    const isTradeRunningForSelectedType = !!currentTypePos;
+
+    // Check if this signal is still active (no subsequent exit alert on the symbol)
+    const exitExists = signals.some(s => 
+      s.symbol === item.symbol && 
+      ['EXIT', 'EXIT_LONG', 'EXIT_SHORT', 'CLOSE', 'COVER', 'SELL'].includes(s.action) && 
+      s.id > item.id
+    );
+    const isActiveSignal = !exitExists && (isLong || isShort);
+
+    const baseSymbol = getNormalizedBaseSymbol(item.symbol);
+    const isMuted = mutedSymbols.includes(baseSymbol);
+
     return (
-      <View style={[styles.card, cardStyle]}>
+      <View style={[styles.card, cardStyle, isMuted && { opacity: 0.6 }]}>
         <View style={styles.cardHeader}>
-          <Text style={styles.symbol}>{item.symbol}</Text>
-          <View style={[styles.badge, badgeStyle]}>
-            <Text style={styles.badgeText}>{item.action}</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Text style={styles.symbol}>{item.symbol}</Text>
+            <TouchableOpacity onPress={() => handleToggleMute(item.symbol)} style={{ marginLeft: 8, padding: 4 }}>
+              <Text style={{ fontSize: 14 }}>{isMuted ? '🔕' : '🔔'}</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            {isMuted && (
+              <View style={[styles.badge, { backgroundColor: '#4b5563', marginRight: 6 }]}>
+                <Text style={styles.badgeText}>MUTED</Text>
+              </View>
+            )}
+            <View style={[styles.badge, badgeStyle]}>
+              <Text style={styles.badgeText}>{item.action}</Text>
+            </View>
           </View>
         </View>
         <View style={styles.cardBody}>
           <View>
             <Text style={styles.priceLabel}>ENTRY PRICE</Text>
-            <Text style={styles.price}>₹{item.price.toLocaleString('en-IN', {minimumFractionDigits: 2})}</Text>
+            <Text style={styles.price}>{currencySymbol}{item.price.toLocaleString(locale, {minimumFractionDigits: 2})}</Text>
           </View>
           <View style={styles.meta}>
             <Text style={styles.source}>{item.source_name}</Text>
             <Text style={styles.time}>{new Date(item.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</Text>
           </View>
         </View>
+
+        {/* Dynamic Execution Panel */}
+        {isActiveSignal ? (
+          <View style={styles.execPanel}>
+            {/* If a trade is running for this selected contract type, show the locked banner */}
+            {isTradeRunningForSelectedType ? (
+              <View style={[styles.execPanelLocked, { marginTop: 0, marginBottom: 8 }]}>
+                <Text style={styles.lockedText}>
+                  ⚠️ {tradeType} trade running on this signal with {currentTypePos.lot_size || 1} Lots
+                </Text>
+              </View>
+            ) : null}
+
+            {/* Lot Selector */}
+            <View style={[styles.lotRow, isTradeRunningForSelectedType && { opacity: 0.5 }]}>
+              <Text style={styles.lotLabel}>LOTS:</Text>
+              <View style={styles.lotControls}>
+                <TouchableOpacity 
+                  style={styles.lotBtn} 
+                  onPress={() => !isTradeRunningForSelectedType && setSelectedLots(prev => ({ ...prev, [item.id]: Math.max(1, (prev[item.id] || 1) - 1) }))}
+                  disabled={isTradeRunningForSelectedType}
+                >
+                  <Text style={styles.lotBtnText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.lotValue}>{lots}</Text>
+                <TouchableOpacity 
+                  style={styles.lotBtn} 
+                  onPress={() => !isTradeRunningForSelectedType && setSelectedLots(prev => ({ ...prev, [item.id]: (prev[item.id] || 1) + 1 }))}
+                  disabled={isTradeRunningForSelectedType}
+                >
+                  <Text style={styles.lotBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={styles.qtyBrackets}>({qtyLabel})</Text>
+            </View>
+
+            {/* Trade Toggles */}
+            <View style={styles.toggleRow}>
+              <View style={styles.toggleGroup}>
+                <TouchableOpacity 
+                  style={[styles.toggleBtn, tradeType === 'FUTURE' && styles.toggleActive]}
+                  onPress={() => setSelectedTradeTypes(prev => ({ ...prev, [item.id]: 'FUTURE' }))}
+                >
+                  <Text style={[styles.toggleBtnText, tradeType === 'FUTURE' && styles.toggleActiveText]}>FUTURE</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={[styles.toggleBtn, tradeType === 'OPTION' && styles.toggleActive]}
+                  onPress={() => setSelectedTradeTypes(prev => ({ ...prev, [item.id]: 'OPTION' }))}
+                >
+                  <Text style={[styles.toggleBtnText, tradeType === 'OPTION' && styles.toggleActiveText]}>OPTION</Text>
+                </TouchableOpacity>
+              </View>
+              
+              <View style={[styles.toggleGroup, isTradeRunningForSelectedType && { opacity: 0.5 }]}>
+                <TouchableOpacity 
+                  style={[styles.toggleBtn, mode === 'PAPER' && styles.toggleActiveMode]}
+                  onPress={() => !isTradeRunningForSelectedType && setSelectedModes(prev => ({ ...prev, [item.id]: 'PAPER' }))}
+                  disabled={isTradeRunningForSelectedType}
+                >
+                  <Text style={[styles.toggleBtnText, mode === 'PAPER' && styles.toggleActiveText]}>PAPER</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                  style={[styles.toggleBtn, mode === 'LIVE' && styles.toggleActiveModeLive]}
+                  onPress={() => !isTradeRunningForSelectedType && setSelectedModes(prev => ({ ...prev, [item.id]: 'LIVE' }))}
+                  disabled={isTradeRunningForSelectedType}
+                >
+                  <Text style={[styles.toggleBtnText, mode === 'LIVE' && styles.toggleActiveText]}>LIVE</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Execute Button */}
+            {!isTradeRunningForSelectedType ? (
+              <TouchableOpacity 
+                style={styles.executeBtn}
+                onPress={() => handleExecuteOrder(item.id, item.symbol)}
+                disabled={submitting[item.id]}
+              >
+                <Text style={styles.executeBtnText}>
+                  {submitting[item.id] ? 'EXECUTING...' : 'EXECUTE ORDER'}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+          </View>
+        ) : (isLong || isShort) ? (
+          <View style={styles.execPanelLocked}>
+            <Text style={styles.lockedTextExpired}>Signal inactive (trend exited)</Text>
+          </View>
+        ) : (
+          <View style={styles.execPanelLocked}>
+            <Text style={styles.lockedTextExpired}>Exit Signal (No Entry Allowed)</Text>
+          </View>
+        )}
       </View>
     );
   };
@@ -77,8 +351,27 @@ export default function FeedScreen() {
     );
   }
 
+  const combinedPnl = brokerStatus.combined_open_pnl || 0;
+  const pnlColor = combinedPnl > 0 ? '#10b981' : (combinedPnl < 0 ? '#ef4444' : '#ffffff');
+
   return (
     <View style={styles.container}>
+      {/* Account Overview Sticky Banner */}
+      <View style={styles.bannerContainer}>
+        <View style={styles.bannerLeft}>
+          <Text style={styles.bannerLabel}>{brokerStatus.broker_name.toUpperCase()}</Text>
+          <Text style={styles.bannerBalance}>
+            ₹{brokerStatus.balance.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+          </Text>
+        </View>
+        <View style={styles.bannerRight}>
+          <Text style={styles.bannerLabel}>COMBINED OPEN P&L</Text>
+          <Text style={[styles.bannerPnl, { color: pnlColor }]}>
+            {combinedPnl >= 0 ? '+' : ''}₹{combinedPnl.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+          </Text>
+        </View>
+      </View>
+
       <FlatList
         data={signals}
         keyExtractor={(item) => item.id.toString()}
@@ -161,6 +454,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-end',
+    marginBottom: 4,
   },
   priceLabel: {
     fontSize: 9,
@@ -201,5 +495,154 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     textAlign: 'center',
     paddingHorizontal: 30,
+  },
+  bannerContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+  },
+  bannerLeft: {
+    flex: 1.2,
+  },
+  bannerRight: {
+    flex: 1,
+    alignItems: 'flex-end',
+  },
+  bannerLabel: {
+    fontSize: 8,
+    fontWeight: 'bold',
+    color: '#9ca3af',
+    marginBottom: 4,
+  },
+  bannerBalance: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#ffffff',
+  },
+  bannerPnl: {
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  execPanel: {
+    backgroundColor: 'rgba(255, 255, 255, 0.02)',
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 10,
+  },
+  execPanelLocked: {
+    backgroundColor: 'rgba(255, 255, 255, 0.01)',
+    borderColor: 'rgba(255, 255, 255, 0.03)',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 8,
+    marginTop: 10,
+    alignItems: 'center',
+  },
+  lockedText: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#fbbf24',
+  },
+  lockedTextExpired: {
+    fontSize: 10,
+    color: '#6b7280',
+    fontStyle: 'italic',
+  },
+  lotRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  lotLabel: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#ffffff',
+    marginRight: 8,
+  },
+  lotControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    borderRadius: 6,
+    padding: 2,
+  },
+  lotBtn: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderRadius: 4,
+    width: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  lotBtnText: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#ffffff',
+  },
+  lotValue: {
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#ffffff',
+    paddingHorizontal: 8,
+  },
+  qtyBrackets: {
+    fontSize: 9,
+    color: '#9ca3af',
+    marginLeft: 8,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  toggleGroup: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+    padding: 2,
+    width: '48%',
+  },
+  toggleBtn: {
+    flex: 1,
+    paddingVertical: 4,
+    borderRadius: 4,
+    alignItems: 'center',
+  },
+  toggleActive: {
+    backgroundColor: '#3b82f6',
+  },
+  toggleActiveMode: {
+    backgroundColor: '#6b7280',
+  },
+  toggleActiveModeLive: {
+    backgroundColor: '#10b981',
+  },
+  toggleBtnText: {
+    fontSize: 9,
+    fontWeight: 'bold',
+    color: '#9ca3af',
+  },
+  toggleActiveText: {
+    color: '#ffffff',
+  },
+  executeBtn: {
+    backgroundColor: '#10b981',
+    borderRadius: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  executeBtnText: {
+    fontSize: 10,
+    fontWeight: 'bold',
+    color: '#ffffff',
   },
 });
