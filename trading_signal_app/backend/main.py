@@ -175,20 +175,44 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         
     return user
 
+def get_base_symbol(symbol: str) -> str:
+    s = symbol.upper().strip()
+    if ":" in s:
+        s = s.split(":")[-1]
+    
+    # Check if option symbol
+    parse_res = parse_option_symbol(s)
+    if parse_res.get("is_option"):
+        underlying = parse_res["underlying"]
+        return get_base_symbol(underlying)
+        
+    if s.endswith("1!"):
+        s = s[:-2]
+    elif s.endswith("!"):
+        s = s[:-1]
+        
+    if "XAU" in s or "GOLD" in s:
+        return "GOLD"
+    if "SILVER" in s:
+        return "SILVER"
+    if "BANKNIFTY" in s or "BNF" in s:
+        return "BANKNIFTY"
+    if "NIFTY" in s:
+        return "NIFTY"
+    if "SENSEX" in s or "BSX" in s:
+        return "SENSEX"
+    if "CRUDE" in s:
+        return "CRUDEOIL"
+    return s
+
 def is_symbol_muted(symbol: str, muted_symbols_str: str) -> bool:
     if not muted_symbols_str:
         return False
-    muted_list = [s.strip().upper() for s in muted_symbols_str.split(",") if s.strip()]
-    sym_upper = symbol.upper().strip()
-    
-    if sym_upper in muted_list:
-        return True
         
-    for muted in muted_list:
-        if muted in sym_upper:
-            return True
-            
-    return False
+    target_base = get_base_symbol(symbol)
+    muted_list = [get_base_symbol(s) for s in muted_symbols_str.split(",") if s.strip()]
+    
+    return target_base in muted_list
 
 # Settings endpoints
 class MuteRequest(BaseModel):
@@ -829,6 +853,54 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     elif "SENSEX" in underlying_norm or "BSX" in underlying_norm:
         underlying_norm = "SENSEX"
         
+    # Calculate Option details (At-The-Money CE/PE option contract)
+    has_options = underlying_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
+    opt_strike = None
+    opt_symbol = None
+    opt_premium = None
+    opt_type = None
+    
+    # Check if the incoming signal is directly on an Option contract
+    parse_res = parse_option_symbol(symbol_norm)
+    is_option_signal = parse_res.get("is_option", False)
+    
+    if is_option_signal:
+        opt_symbol = parse_res["formatted_symbol"]
+        opt_strike = parse_res["strike"]
+        opt_type = parse_res["opt_type"]
+        expiry_date = parse_res.get("expiry_date")
+        
+        # If the price in payload is at the scale of an option premium
+        if price_val > 0 and price_val < 0.2 * opt_strike:
+            opt_premium = price_val
+        else:
+            # Price is index price or 0. Fetch index price and calculate BS premium
+            index_p = price_val if price_val > 0 else (get_live_market_price(underlying_norm) or opt_strike)
+            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, index_p, expiry_date=expiry_date)
+            price_val = index_p
+    elif has_options and price_val > 0:
+        step = 50 if underlying_norm == "NIFTY" else 100
+        opt_strike = int(round(price_val / step) * step)
+        
+        if action_norm in ["BUY", "LONG"]:
+            opt_type = "CE"
+        elif action_norm in ["SELL", "SHORT"]:
+            opt_type = "PE"
+                
+        if opt_type:
+            # Determine expiry date
+            if underlying_norm == "BANKNIFTY":
+                expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+            elif underlying_norm == "NIFTY":
+                expiry_date = get_next_weekly_expiry(ist_now, 1)
+            elif underlying_norm == "SENSEX":
+                expiry_date = get_next_weekly_expiry(ist_now, 3)
+            else:
+                expiry_date = get_next_weekly_expiry(ist_now, 1)
+                
+            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
+            opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
+            
     # Check for open positions on this symbol or its options
     # Save signal in database in IST
     signal_entry = Signal(
