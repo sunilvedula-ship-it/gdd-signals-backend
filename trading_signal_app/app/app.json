@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "SKI Analytics",
-    "slug": "ski-analytics",
+    "slug": "gdd-signals",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/logo.png",
