@@ -1634,10 +1634,16 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
                 detail="No API Credentials configured. Please configure your broker credentials under the Auto-Trade tab before executing a live order."
             )
 
-    # Check if the signal is still active (no subsequent exit alert on the symbol)
+    # Check if the signal is still active (no subsequent exit alert on the symbol matching direction)
+    exit_actions = ["EXIT", "CLOSE"]
+    if signal.action.upper() in ["LONG", "BUY"]:
+        exit_actions.extend(["EXIT_LONG", "SELL"])
+    elif signal.action.upper() in ["SHORT", "SELL"]:
+        exit_actions.extend(["EXIT_SHORT", "COVER"])
+
     exit_exists = db.query(Signal).filter(
         Signal.symbol == signal.symbol,
-        Signal.action.in_(["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL"]),
+        Signal.action.in_(exit_actions),
         Signal.timestamp > signal.timestamp
     ).first()
     if exit_exists:

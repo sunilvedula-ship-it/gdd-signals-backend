@@ -229,10 +229,17 @@ export default function FeedScreen({ session }) {
     const currentTypePos = tradeType === 'FUTURE' ? existingFuturePos : existingOptionPos;
     const isTradeRunningForSelectedType = !!currentTypePos;
 
-    // Check if this signal is still active (no subsequent exit alert on the symbol)
+    // Check if this signal is still active (no subsequent exit alert on the symbol matching direction)
+    const exitActions = ['EXIT', 'CLOSE'];
+    if (isLong) {
+      exitActions.push('EXIT_LONG', 'SELL');
+    } else if (isShort) {
+      exitActions.push('EXIT_SHORT', 'COVER');
+    }
+
     const exitExists = signals.some(s => 
       s.symbol === item.symbol && 
-      ['EXIT', 'EXIT_LONG', 'EXIT_SHORT', 'CLOSE', 'COVER', 'SELL'].includes(s.action) && 
+      exitActions.includes(s.action) && 
       s.id > item.id
     );
     const isActiveSignal = !exitExists && (isLong || isShort);
