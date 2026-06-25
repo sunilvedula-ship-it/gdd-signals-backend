@@ -2,12 +2,29 @@ import React, { useState, useEffect } from 'react';
 import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity } from 'react-native';
 import { BACKEND_URL } from '../config';
 
+const formatSignalDate = (isoString) => {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return '';
+  const day = String(date.getDate()).padStart(2, '0');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[date.getMonth()];
+  const year = date.getFullYear();
+  let hours = date.getHours();
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+  const hoursStr = String(hours).padStart(2, '0');
+  return `${day}-${month}-${year} ${hoursStr}:${minutes} ${ampm}`;
+};
 
 export default function FeedScreen({ session }) {
   const [signals, setSignals] = useState([]);
   const [brokerStatus, setBrokerStatus] = useState({ status: 'sandbox', broker_name: 'Sandbox Broker', balance: 1000000, mode: 'SANDBOX', combined_open_pnl: 0 });
   const [positions, setPositions] = useState([]);
   const [mutedSymbols, setMutedSymbols] = useState([]);
+  const [consentSigned, setConsentSigned] = useState(true);
   
   const [selectedLots, setSelectedLots] = useState({});
   const [selectedTradeTypes, setSelectedTradeTypes] = useState({});
@@ -43,6 +60,13 @@ export default function FeedScreen({ session }) {
       if (settingsRes.ok) {
         const settingsData = await settingsRes.json();
         setMutedSymbols(settingsData.muted_symbols || []);
+      }
+
+      // Fetch daily consent status
+      const consentRes = await fetch(`${BACKEND_URL}/api/consent`, { headers });
+      if (consentRes.ok) {
+        const consentData = await consentRes.json();
+        setConsentSigned(consentData.consent_signed);
       }
     } catch (error) {
       console.error("Error loading signals & broker info:", error);
@@ -226,6 +250,11 @@ export default function FeedScreen({ session }) {
             </TouchableOpacity>
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            {item.timeframe && (
+              <View style={[styles.badge, styles.badgeTimeframe, { marginRight: 6 }]}>
+                <Text style={styles.badgeText}>⏱ {item.timeframe}</Text>
+              </View>
+            )}
             {isMuted && (
               <View style={[styles.badge, { backgroundColor: '#4b5563', marginRight: 6 }]}>
                 <Text style={styles.badgeText}>MUTED</Text>
@@ -243,7 +272,7 @@ export default function FeedScreen({ session }) {
           </View>
           <View style={styles.meta}>
             <Text style={styles.source}>{item.source_name}</Text>
-            <Text style={styles.time}>{new Date(item.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</Text>
+            <Text style={styles.time}>{formatSignalDate(item.timestamp)}</Text>
           </View>
         </View>
 
@@ -372,6 +401,14 @@ export default function FeedScreen({ session }) {
         </View>
       </View>
 
+      {!consentSigned && (
+        <View style={styles.consentWarningBanner}>
+          <Text style={styles.consentWarningText}>
+            ⚠️ Auto-Trading Paused: Please sign today's daily consent on the Consent tab.
+          </Text>
+        </View>
+      )}
+
       <FlatList
         data={signals}
         keyExtractor={(item) => item.id.toString()}
@@ -444,6 +481,11 @@ const styles = StyleSheet.create({
   },
   badgeNeutral: {
     backgroundColor: 'rgba(100, 116, 139, 0.15)',
+  },
+  badgeTimeframe: {
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    borderWidth: 1,
   },
   badgeText: {
     fontSize: 10,
@@ -644,5 +686,21 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: 'bold',
     color: '#ffffff',
+  },
+  consentWarningBanner: {
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    borderColor: 'rgba(239, 68, 68, 0.25)',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  consentWarningText: {
+    color: '#ef4444',
+    fontSize: 11,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    lineHeight: 16,
   },
 });

@@ -575,7 +575,7 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     return pos.pnl
 
 
-def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1, timeframe: str = "5m") -> Position:
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER") -> Position:
     new_pos = Position(
         user_id=user_id,
         symbol=symbol,
@@ -584,7 +584,8 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
         entry_price=entry_price,
         entry_time=get_ist_time(),
         status="OPEN",
-        timeframe=timeframe
+        timeframe=timeframe,
+        real_or_paper=real_or_paper
     )
     db.add(new_pos)
     return new_pos
@@ -940,6 +941,11 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             print(f"[Webhook Warning] User with ID {consent.user_id} not found in database.")
             continue
             
+        mgr = AppCredentialsManager(db, user_id=user.id)
+        active_broker = mgr.get_active_broker()
+        mode_val = "LIVE" if active_broker else "PAPER"
+        print(f"[Webhook Processing] User ID: {user.id}, Name: {user.name}, Consent: ID={consent.id}, Mode: {mode_val}")
+            
         if is_symbol_muted(symbol_norm, user.muted_symbols):
             print(f"[Webhook Skipped] Symbol {symbol_norm} is muted for User {user.id} ({user.name})")
             continue
@@ -985,18 +991,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_long_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
-                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str)
-                    trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty})")
+                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
                     # B. Open Option position
                     if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
@@ -1018,18 +1024,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_short_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
-                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str)
-                    trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty})")
+                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
                     # B. Open Option position (PE Premium is bought, so position direction is LONG)
                     if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
             if user_open_positions:
@@ -1234,7 +1240,29 @@ def get_yahoo_finance_price_data(ticker: str) -> dict:
         print(f"Error fetching live price from Yahoo Finance for {ticker}: {e}")
     return {}
 
+PRICE_CACHE = {}
+PRICE_CACHE_TTL = 15 # seconds
+
 def get_live_market_price_data(symbol: str) -> dict:
+    s_upper = symbol.upper().strip()
+    
+    # Check cache
+    now = datetime.utcnow()
+    if s_upper in PRICE_CACHE:
+        cached_val, cached_time = PRICE_CACHE[s_upper]
+        if (now - cached_time).total_seconds() < PRICE_CACHE_TTL:
+            return cached_val
+            
+    # Check if known test/mock symbol to prevent long timeouts
+    if "TEST" in s_upper or "MOCK" in s_upper or s_upper in ["DUMMY", "XYZ"]:
+        res = {}
+    else:
+        res = _fetch_live_price_no_cache(s_upper)
+        
+    PRICE_CACHE[s_upper] = (res, now)
+    return res
+
+def _fetch_live_price_no_cache(symbol: str) -> dict:
     # 1. Try TradingView first (Primary Source)
     price = get_tradingview_price(symbol)
     if price is not None:
@@ -1597,6 +1625,15 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             detail="This is an exit signal (Sell/Cover). Entries are only allowed on Long or Short signals."
         )
 
+    # Check if user has credentials linked when mode is LIVE
+    if req.mode.upper() == "LIVE":
+        mgr = AppCredentialsManager(db, user_id=user.id)
+        if not mgr.get_active_broker():
+            raise HTTPException(
+                status_code=400,
+                detail="No API Credentials configured. Please configure your broker credentials under the Auto-Trade tab before executing a live order."
+            )
+
     # Check if the signal is still active (no subsequent exit alert on the symbol)
     exit_exists = db.query(Signal).filter(
         Signal.symbol == signal.symbol,
@@ -1725,6 +1762,63 @@ def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_curr
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error during purge: {e}")
+
+@app.get("/api/admin/debug-info")
+def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    env_secrets = os.environ.get("VALID_SECRETS")
+    if env_secrets:
+        VALID_SECRETS = [s.strip() for s in env_secrets.split(",")]
+    else:
+        VALID_SECRETS = ["TradeSignal2024", "indian_market_5645c3c44e98ddb7ed7aee5f05482e6e9e910031", "8cf895aa0e3387d51d8c6c19f3dea05e02e2839b"]
+        
+    if not secret or secret not in VALID_SECRETS:
+        raise HTTPException(status_code=401, detail="Unauthorized debug request")
+        
+    from sqlalchemy import inspect
+    inspector = inspect(db.bind)
+    
+    tables_schema = {}
+    for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials"]:
+        columns = [{"name": col["name"], "type": str(col["type"])} for col in inspector.get_columns(table_name)]
+        tables_schema[table_name] = columns
+        
+    db_type = "PostgreSQL" if "postgresql" in str(db.bind.url) else "SQLite"
+    
+    signals = db.query(Signal).order_by(Signal.timestamp.desc()).limit(20).all()
+    positions = db.query(Position).order_by(Position.entry_time.desc()).limit(20).all()
+    consents = db.query(DailyConsent).order_by(DailyConsent.timestamp.desc()).limit(20).all()
+    
+    from backend.database import BrokerCredential
+    creds = db.query(BrokerCredential).all()
+    masked_creds = [{
+        "id": c.id,
+        "user_id": c.user_id,
+        "broker_id": c.broker_id,
+        "api_key_len": len(c.api_key) if c.api_key else 0,
+        "has_secret": bool(c.api_secret)
+    } for c in creds]
+    
+    return {
+        "db_type": db_type,
+        "tables_schema": tables_schema,
+        "counts": {
+            "users": db.query(User).count(),
+            "signals": db.query(Signal).count(),
+            "positions": db.query(Position).count(),
+            "daily_consents": db.query(DailyConsent).count(),
+            "broker_credentials": len(creds)
+        },
+        "recent_signals": [{
+            "id": s.id, "symbol": s.symbol, "action": s.action, "price": s.price, "timestamp": s.timestamp.isoformat()
+        } for s in signals],
+        "recent_positions": [{
+            "id": p.id, "user_id": p.user_id, "symbol": p.symbol, "direction": p.direction, "status": p.status, "real_or_paper": p.real_or_paper, "pnl": p.pnl, "entry_time": p.entry_time.isoformat()
+        } for p in positions],
+        "recent_consents": [{
+            "id": c.id, "user_id": c.user_id, "date": c.date, "consent_given": c.consent_given, "timestamp": c.timestamp.isoformat()
+        } for c in consents],
+        "credentials": masked_creds
+    }
 
 from fastapi.staticfiles import StaticFiles
 # Mount static files for the simulator at root

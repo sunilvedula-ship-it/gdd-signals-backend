@@ -175,6 +175,36 @@ def init_db():
         except Exception:
             db.rollback()
 
+        # Migrate user_id to daily_consents table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE daily_consents ADD COLUMN IF NOT EXISTS user_id INTEGER DEFAULT 1;"))
+            else:
+                db.execute(text("ALTER TABLE daily_consents ADD COLUMN user_id INTEGER DEFAULT 1;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate real_or_paper to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS real_or_paper VARCHAR(50) DEFAULT 'PAPER';"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN real_or_paper VARCHAR(50) DEFAULT 'PAPER';"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate lot_size to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS lot_size INTEGER DEFAULT 1;"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN lot_size INTEGER DEFAULT 1;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         print("[DB] Successfully verified and completed all database migrations.")
     except Exception as e:
         print(f"[DB] Migration error: {e}")
