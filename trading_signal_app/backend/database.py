@@ -58,6 +58,7 @@ class Signal(Base):
     source = Column(String)  # TV_ALERT, SCANNER
     source_name = Column(String)  # e.g., LEN1: KST-ST, ANDEAN, etc.
     raw_payload = Column(String)  # JSON dump of incoming alert
+    timeframe = Column(String, default="5m", nullable=True)
 
 class Position(Base):
     __tablename__ = 'positions'
@@ -76,6 +77,7 @@ class Position(Base):
     pnl = Column(Float, default=0.0)
     real_or_paper = Column(String, default="PAPER")  # PAPER, LIVE
     signal_id = Column(Integer, ForeignKey('signals.id'), nullable=True)
+    timeframe = Column(String, default="5m", nullable=True)
 
 class DailyConsent(Base):
     __tablename__ = 'daily_consents'
@@ -149,6 +151,26 @@ def init_db():
         try:
             db.execute(text("DROP INDEX IF EXISTS ix_broker_credentials_broker_id;"))
             db.execute(text("CREATE INDEX ix_broker_credentials_broker_id ON broker_credentials (broker_id);"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate timeframe to signals table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe VARCHAR(50) DEFAULT '5m';"))
+            else:
+                db.execute(text("ALTER TABLE signals ADD COLUMN timeframe VARCHAR(50) DEFAULT '5m';"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate timeframe to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS timeframe VARCHAR(50) DEFAULT '5m';"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN timeframe VARCHAR(50) DEFAULT '5m';"))
             db.commit()
         except Exception:
             db.rollback()

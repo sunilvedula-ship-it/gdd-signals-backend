@@ -575,7 +575,7 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     return pos.pnl
 
 
-def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1) -> Position:
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1, timeframe: str = "5m") -> Position:
     new_pos = Position(
         user_id=user_id,
         symbol=symbol,
@@ -583,7 +583,8 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
         qty=qty,
         entry_price=entry_price,
         entry_time=get_ist_time(),
-        status="OPEN"
+        status="OPEN",
+        timeframe=timeframe
     )
     db.add(new_pos)
     return new_pos
@@ -697,6 +698,15 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         symbol = "BTCUSD"
             
     symbol_norm = normalize_symbol(symbol)
+    
+    # Resolve Timeframe
+    raw_timeframe = payload.get("timeframe") or payload.get("interval")
+    if raw_timeframe:
+        timeframe_str = str(raw_timeframe).strip()
+        if timeframe_str.isdigit():
+            timeframe_str = f"{timeframe_str}m"
+    else:
+        timeframe_str = "5m"
     
     # 3. Resolve Price
     price = payload.get("price") or payload.get("signal_price")
@@ -910,7 +920,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         source=source,
         source_name=source_name,
         raw_payload=json.dumps(payload),
-        timestamp=ist_now
+        timestamp=ist_now,
+        timeframe=timeframe_str
     )
     db.add(signal_entry)
     db.commit()
@@ -920,10 +931,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     # 5. Process execution for each user who gave consent for today
     today_str = ist_now.date().isoformat()
     consents = db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.consent_given == True).all()
+    if not consents:
+        print(f"[Webhook Skipped] No active daily consent found for date {today_str}. Auto-paper trades skipped.")
     
     for consent in consents:
         user = db.query(User).filter(User.id == consent.user_id).first()
         if not user:
+            print(f"[Webhook Warning] User with ID {consent.user_id} not found in database.")
             continue
             
         if is_symbol_muted(symbol_norm, user.muted_symbols):
@@ -971,17 +985,17 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_long_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
                     trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id)
+                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str)
                     trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty})")
                     
                     # B. Open Option position
                     if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id)
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
                         trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
                     
         elif user_action in ["SELL", "SHORT"]:
@@ -1004,17 +1018,17 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_short_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
                     trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty})")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id)
+                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str)
                     trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty})")
                     
                     # B. Open Option position (PE Premium is bought, so position direction is LONG)
                     if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id)
+                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str)
                         trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty})")
                     
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
@@ -1047,7 +1061,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             "action": signal_entry.action,
             "price": signal_entry.price,
             "source": signal_entry.source,
-            "source_name": signal_entry.source_name
+            "source_name": signal_entry.source_name,
+            "timeframe": signal_entry.timeframe
         },
         "consent_signed": len(consents) > 0,
         "logs": trade_log
@@ -1068,7 +1083,8 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "action": s.action,
         "price": s.price,
         "source": s.source,
-        "source_name": s.source_name
+        "source_name": s.source_name,
+        "timeframe": s.timeframe
     } for s in filtered_signals]
 
 def get_tradingview_price(symbol: str) -> Optional[float]:
@@ -1340,7 +1356,8 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "current_price": current_price,
                 "pnl": round(pnl, 2),
                 "real_or_paper": p.real_or_paper,
-                "signal_id": p.signal_id
+                "signal_id": p.signal_id,
+                "timeframe": p.timeframe
             })
         else:
             pnl = p.pnl
@@ -1361,7 +1378,8 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "status": p.status,
                 "pnl": p.pnl,
                 "real_or_paper": p.real_or_paper,
-                "signal_id": p.signal_id
+                "signal_id": p.signal_id,
+                "timeframe": p.timeframe
             })
             
     total_trades = len(closed_positions)
