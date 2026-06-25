@@ -408,7 +408,7 @@ export default function FeedScreen({ session }) {
         </View>
       </View>
 
-      {!consentSigned && (
+      {brokerStatus.mode === 'LIVE' && !consentSigned && (
         <View style={styles.consentWarningBanner}>
           <Text style={styles.consentWarningText}>
             ⚠️ Auto-Trading Paused: Please sign today's daily consent on the Consent tab.

@@ -929,22 +929,28 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     
     trade_log = []
     
-    # 5. Process execution for each user who gave consent for today
+    # 5. Process execution for all users
     today_str = ist_now.date().isoformat()
-    consents = db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.consent_given == True).all()
-    if not consents:
-        print(f"[Webhook Skipped] No active daily consent found for date {today_str}. Auto-paper trades skipped.")
+    users = db.query(User).all()
+    processed_users_count = 0
     
-    for consent in consents:
-        user = db.query(User).filter(User.id == consent.user_id).first()
-        if not user:
-            print(f"[Webhook Warning] User with ID {consent.user_id} not found in database.")
-            continue
-            
+    for user in users:
         mgr = AppCredentialsManager(db, user_id=user.id)
         active_broker = mgr.get_active_broker()
         mode_val = "LIVE" if active_broker else "PAPER"
-        print(f"[Webhook Processing] User ID: {user.id}, Name: {user.name}, Consent: ID={consent.id}, Mode: {mode_val}")
+        
+        # Daily consent is only required for LIVE mode users
+        if mode_val == "LIVE":
+            consent = db.query(DailyConsent).filter(
+                DailyConsent.date == today_str,
+                DailyConsent.user_id == user.id,
+                DailyConsent.consent_given == True
+            ).first()
+            if not consent:
+                print(f"[Webhook Skipped] User ID: {user.id} ({user.name}) is in LIVE mode but has not signed daily consent for today ({today_str})")
+                continue
+                
+        print(f"[Webhook Processing] User ID: {user.id}, Name: {user.name}, Mode: {mode_val}")
             
         if is_symbol_muted(symbol_norm, user.muted_symbols):
             print(f"[Webhook Skipped] Symbol {symbol_norm} is muted for User {user.id} ({user.name})")
@@ -1054,6 +1060,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                         trade_log.append(f"User {user.id}: Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
             else:
                 trade_log.append(f"User {user.id}: Received exit signal for {symbol_norm} but no open position existed")
+        processed_users_count += 1
                 
     db.commit()
     
@@ -1070,12 +1077,12 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             "source_name": signal_entry.source_name,
             "timeframe": signal_entry.timeframe
         },
-        "consent_signed": len(consents) > 0,
+        "consent_signed": True,
         "logs": trade_log
     }
     await manager.broadcast(json.dumps(ws_data))
     
-    return {"status": "success", "processed_signals": len(consents), "actions": trade_log, "consent_signed": len(consents) > 0}
+    return {"status": "success", "processed_signals": processed_users_count, "actions": trade_log, "consent_signed": True}
 
 
 @app.get("/api/signals")
