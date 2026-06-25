@@ -1765,12 +1765,13 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
 def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
         num_positions = db.query(Position).filter(Position.user_id == user.id).delete()
+        num_signals = db.query(Signal).delete()
         db.commit()
         return {
             "status": "success",
             "purged_positions": num_positions,
-            "purged_signals": 0,
-            "detail": "Successfully cleared all user positions."
+            "purged_signals": num_signals,
+            "detail": "Successfully cleared all user positions and signals."
         }
     except Exception as e:
         db.rollback()
