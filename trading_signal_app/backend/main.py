@@ -1823,7 +1823,10 @@ def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User
         "recent_consents": [{
             "id": c.id, "user_id": c.user_id, "date": c.date, "consent_given": c.consent_given, "timestamp": c.timestamp.isoformat()
         } for c in consents],
-        "credentials": masked_creds
+        "credentials": masked_creds,
+        "all_users": [{
+            "id": u.id, "name": u.name, "email": u.email, "phone": u.phone, "supabase_uid": u.supabase_uid
+        } for u in db.query(User).all()]
     }
 
 from fastapi.staticfiles import StaticFiles
