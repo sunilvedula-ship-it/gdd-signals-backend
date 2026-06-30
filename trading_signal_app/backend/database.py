@@ -59,6 +59,7 @@ class Signal(Base):
     source_name = Column(String)  # e.g., LEN1: KST-ST, ANDEAN, etc.
     raw_payload = Column(String)  # JSON dump of incoming alert
     timeframe = Column(String, default="5m", nullable=True)
+    trade_type = Column(String, default="INTRADAY", nullable=True) # INTRADAY, POSITIONAL
 
 class Position(Base):
     __tablename__ = 'positions'
@@ -78,6 +79,7 @@ class Position(Base):
     real_or_paper = Column(String, default="PAPER")  # PAPER, LIVE
     signal_id = Column(Integer, ForeignKey('signals.id'), nullable=True)
     timeframe = Column(String, default="5m", nullable=True)
+    trade_type = Column(String, default="INTRADAY", nullable=True) # INTRADAY, POSITIONAL
 
 class DailyConsent(Base):
     __tablename__ = 'daily_consents'
@@ -201,6 +203,26 @@ def init_db():
                 db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS lot_size INTEGER DEFAULT 1;"))
             else:
                 db.execute(text("ALTER TABLE positions ADD COLUMN lot_size INTEGER DEFAULT 1;"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate trade_type to signals table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE signals ADD COLUMN IF NOT EXISTS trade_type VARCHAR(50) DEFAULT 'INTRADAY';"))
+            else:
+                db.execute(text("ALTER TABLE signals ADD COLUMN trade_type VARCHAR(50) DEFAULT 'INTRADAY';"))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        # Migrate trade_type to positions table
+        try:
+            if "postgresql" in DATABASE_URL:
+                db.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS trade_type VARCHAR(50) DEFAULT 'INTRADAY';"))
+            else:
+                db.execute(text("ALTER TABLE positions ADD COLUMN trade_type VARCHAR(50) DEFAULT 'INTRADAY';"))
             db.commit()
         except Exception:
             db.rollback()

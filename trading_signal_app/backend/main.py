@@ -575,7 +575,8 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     return pos.pnl
 
 
-def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER") -> Position:
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, 
+                       user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER", trade_type: str = "INTRADAY") -> Position:
     new_pos = Position(
         user_id=user_id,
         symbol=symbol,
@@ -585,7 +586,8 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
         entry_time=get_ist_time(),
         status="OPEN",
         timeframe=timeframe,
-        real_or_paper=real_or_paper
+        real_or_paper=real_or_paper,
+        trade_type=trade_type
     )
     db.add(new_pos)
     return new_pos
@@ -708,6 +710,22 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             timeframe_str = f"{timeframe_str}m"
     else:
         timeframe_str = "5m"
+        
+    # Resolve Trade Type (INTRADAY or POSITIONAL)
+    raw_trade_type = payload.get("trade_type") or payload.get("type") or payload.get("style")
+    if raw_trade_type:
+        trade_type_str = str(raw_trade_type).strip().upper()
+        if trade_type_str in ["INTRADAY", "POSITIONAL"]:
+            trade_type_val = trade_type_str
+        else:
+            trade_type_val = "POSITIONAL" if "POSITIONAL" in trade_type_str else "INTRADAY"
+    else:
+        # Infer from timeframe/interval
+        t_lower = timeframe_str.lower()
+        if any(x in t_lower for x in ["1d", "daily", "1w", "weekly", "positional"]):
+            trade_type_val = "POSITIONAL"
+        else:
+            trade_type_val = "INTRADAY"
     
     # 3. Resolve Price
     price = payload.get("price") or payload.get("signal_price")
@@ -922,7 +940,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         source_name=source_name,
         raw_payload=json.dumps(payload),
         timestamp=ist_now,
-        timeframe=timeframe_str
+        timeframe=timeframe_str,
+        trade_type=trade_type_val
     )
     db.add(signal_entry)
     db.commit()
@@ -997,18 +1016,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_long_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
-                    # B. Open Option position
-                    if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                    # B. Open Option position (DISABLED: options alerts will trigger options directly)
+                    # if opt_symbol and opt_premium:
+                    #     open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                    #     trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
@@ -1030,18 +1049,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not user_open_positions or is_explicit_short_entry:
                 if is_option_signal:
                     qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                 else:
                     # A. Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
+                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
-                    # B. Open Option position (PE Premium is bought, so position direction is LONG)
-                    if opt_symbol and opt_premium:
-                        open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                    # B. Open Option position (DISABLED: options alerts will trigger options directly)
+                    # if opt_symbol and opt_premium:
+                    #     open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                    #     trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
             if user_open_positions:
@@ -1075,7 +1094,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             "price": signal_entry.price,
             "source": signal_entry.source,
             "source_name": signal_entry.source_name,
-            "timeframe": signal_entry.timeframe
+            "timeframe": signal_entry.timeframe,
+            "trade_type": signal_entry.trade_type or "INTRADAY"
         },
         "consent_signed": True,
         "logs": trade_log
@@ -1097,7 +1117,8 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "price": s.price,
         "source": s.source,
         "source_name": s.source_name,
-        "timeframe": s.timeframe
+        "timeframe": s.timeframe,
+        "trade_type": s.trade_type or "INTRADAY"
     } for s in filtered_signals]
 
 def get_tradingview_price(symbol: str) -> Optional[float]:
@@ -1392,7 +1413,8 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "pnl": round(pnl, 2),
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
-                "timeframe": p.timeframe
+                "timeframe": p.timeframe,
+                "trade_type": p.trade_type or "INTRADAY"
             })
         else:
             pnl = p.pnl
@@ -1414,7 +1436,8 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "pnl": p.pnl,
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
-                "timeframe": p.timeframe
+                "timeframe": p.timeframe,
+                "trade_type": p.trade_type or "INTRADAY"
             })
             
     total_trades = len(closed_positions)
@@ -1729,7 +1752,9 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         entry_time=get_ist_time(),
         status="OPEN",
         real_or_paper=req.mode,
-        signal_id=req.signal_id
+        signal_id=req.signal_id,
+        timeframe=signal.timeframe,
+        trade_type=signal.trade_type
     )
     db.add(new_pos)
     db.commit()
