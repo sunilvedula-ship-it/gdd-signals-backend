@@ -882,17 +882,28 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     elif "SENSEX" in underlying_norm or "BSX" in underlying_norm:
         underlying_norm = "SENSEX"
         
-    # Check if this is a futures alert
-    symbol_upper = symbol_norm.upper()
+    # Check if this is a futures alert using the raw symbol and context
+    raw_sym = str(symbol or "").upper().strip()
+    raw_id = str(payload.get("orderId") or "").upper()
+    raw_type = str(payload.get("signal_type") or "").upper()
+    body_upper = str(body_str or "").upper()
+    
     is_crypto_or_commodity = (
-        symbol_upper in ["GOLD", "CRUDEOIL", "BTCUSD", "ETHUSD", "SOLUSD"] or 
-        "BTC" in symbol_upper or 
-        "ETH" in symbol_upper or 
-        "SOL" in symbol_upper
+        raw_sym in ["GOLD", "CRUDEOIL", "BTCUSD", "ETHUSD", "SOLUSD"] or 
+        "BTC" in raw_sym or 
+        "ETH" in raw_sym or 
+        "SOL" in raw_sym
     )
     is_futures_alert = (
-        "1!" in symbol_upper or 
-        "FUT" in symbol_upper or 
+        "1!" in raw_sym or 
+        "FUT" in raw_sym or 
+        "FUTURES" in raw_sym or
+        "FUT" in raw_id or
+        "FUTURES" in raw_id or
+        "FUT" in raw_type or
+        "FUTURES" in raw_type or
+        "FUT" in body_upper or
+        "FUTURES" in body_upper or
         is_crypto_or_commodity
     )
         
