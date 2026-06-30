@@ -882,6 +882,20 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     elif "SENSEX" in underlying_norm or "BSX" in underlying_norm:
         underlying_norm = "SENSEX"
         
+    # Check if this is a futures alert
+    symbol_upper = symbol_norm.upper()
+    is_crypto_or_commodity = (
+        symbol_upper in ["GOLD", "CRUDEOIL", "BTCUSD", "ETHUSD", "SOLUSD"] or 
+        "BTC" in symbol_upper or 
+        "ETH" in symbol_upper or 
+        "SOL" in symbol_upper
+    )
+    is_futures_alert = (
+        "1!" in symbol_upper or 
+        "FUT" in symbol_upper or 
+        is_crypto_or_commodity
+    )
+        
     # Calculate Option details (At-The-Money CE/PE option contract)
     has_options = underlying_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
     opt_strike = None
@@ -1014,20 +1028,27 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                     trade_log.append(f"User {user.id}: Covered SHORT position on {symbol_norm} (flat)")
                     
             if not user_open_positions or is_explicit_long_entry:
-                if is_option_signal:
-                    qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
-                else:
-                    # A. Open Future position
+                if is_futures_alert:
+                    # Open Future position
                     qty = calculate_trade_qty(symbol_norm)
                     open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
-                    
-                    # B. Open Option position (DISABLED: options alerts will trigger options directly)
-                    # if opt_symbol and opt_premium:
-                    #     open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    #     trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                else:
+                    if is_option_signal:
+                        qty = calculate_trade_qty(underlying_norm)
+                        open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                    else:
+                        # Standard signal (e.g. NIFTY) -> Trade Option
+                        if opt_symbol and opt_premium:
+                            qty = calculate_trade_qty(underlying_norm)
+                            open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                            trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        else:
+                            # Fallback if options are not supported (e.g. stocks)
+                            qty = calculate_trade_qty(symbol_norm)
+                            open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                            trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
@@ -1047,20 +1068,27 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                     trade_log.append(f"User {user.id}: Exited LONG position on {symbol_norm} (flat)")
                     
             if not user_open_positions or is_explicit_short_entry:
-                if is_option_signal:
-                    qty = calculate_trade_qty(underlying_norm)
-                    open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
-                else:
-                    # A. Open Future position
+                if is_futures_alert:
+                    # Open Future position
                     qty = calculate_trade_qty(symbol_norm)
                     open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
                     trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
-                    
-                    # B. Open Option position (DISABLED: options alerts will trigger options directly)
-                    # if opt_symbol and opt_premium:
-                    #     open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    #     trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                else:
+                    if is_option_signal:
+                        qty = calculate_trade_qty(underlying_norm)
+                        open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                        trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                    else:
+                        # Standard signal (e.g. NIFTY) -> Trade Option (PE is bought, direction is LONG)
+                        if opt_symbol and opt_premium:
+                            qty = calculate_trade_qty(underlying_norm)
+                            open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                            trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        else:
+                            # Fallback if options are not supported (e.g. stocks)
+                            qty = calculate_trade_qty(symbol_norm)
+                            open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
+                            trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
             if user_open_positions:
