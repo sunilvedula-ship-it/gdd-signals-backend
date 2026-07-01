@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Supported Brokers definitions
 INDIAN_BROKERS = [
-    {"id": "flattrade",     "name": "Flattrade",         "api_name": "Flattrade Pi API",  "fields": ["api_key", "api_secret"]},
+    {"id": "flattrade",     "name": "Flattrade",         "api_name": "Flattrade Pi API",  "fields": ["client_id", "api_key", "api_secret"]},
     {"id": "zerodha",       "name": "Zerodha",           "api_name": "Kite Connect",      "fields": ["api_key", "api_secret"]},
     {"id": "kotak",         "name": "Kotak Securities",  "api_name": "Kotak Neo API",      "fields": ["api_key", "api_secret", "consumer_key"]},
     {"id": "angelone",      "name": "Angel One",         "api_name": "SmartAPI",           "fields": ["api_key", "api_secret", "client_id"]},

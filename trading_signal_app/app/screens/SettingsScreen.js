@@ -4,8 +4,9 @@ import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
 
-export default function SettingsScreen({ session }) {
+export default function SettingsScreen({ session, onPurge }) {
   const [brokers, setBrokers] = useState([]);
+  const [clientId, setClientId] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [loading, setLoading] = useState(true);
@@ -42,6 +43,9 @@ export default function SettingsScreen({ session }) {
       });
       const data = await response.json();
       if (response.ok) {
+        if (onPurge) {
+          onPurge();
+        }
         Alert.alert("Purge Successful", `Database cleaned successfully.\n- Signals Deleted: ${data.purged_signals}\n- Positions Deleted: ${data.purged_positions}`);
       } else {
         Alert.alert("Purge Failed", data.detail || "Could not clear data.");
@@ -70,8 +74,8 @@ export default function SettingsScreen({ session }) {
   };
 
   const saveCredentials = async () => {
-    if (!apiKey || !apiSecret) {
-      alert("Please fill in both API Key and Secret.");
+    if (!clientId || !apiKey || !apiSecret) {
+      alert("Please fill in Client ID, API Key and Secret.");
       return;
     }
     setLoading(true);
@@ -87,9 +91,12 @@ export default function SettingsScreen({ session }) {
           broker_id: 'flattrade',
           api_key: apiKey,
           api_secret: apiSecret,
-          extra: {}
+          extra: {
+            client_id: clientId
+          }
         })
       });
+      setClientId('');
       setApiKey('');
       setApiSecret('');
       fetchCredentials();
@@ -148,7 +155,18 @@ export default function SettingsScreen({ session }) {
         {configuredBroker ? (
           <View style={styles.configuredContainer}>
             <Text style={styles.configuredTitle}>✓ Configured: {configuredBroker.name}</Text>
-            <Text style={styles.configuredSub}>{configuredBroker.info?.api_key_masked || 'Configured'}</Text>
+            {configuredBroker.info?.extra_fields?.includes('client_id') && (
+              <Text style={styles.configuredSub}>Linked Client ID: {configuredBroker.info?.api_key_masked ? 'Yes' : 'No'}</Text>
+            )}
+            <Text style={styles.configuredSub}>API Key: {configuredBroker.info?.api_key_masked || 'Configured'}</Text>
+            
+            <TouchableOpacity 
+              style={styles.authorizeBtn} 
+              onPress={() => Linking.openURL(`${BACKEND_URL}/api/broker/login/${configuredBroker.id}?token=${session?.access_token || ''}`)}
+            >
+              <Text style={styles.authorizeBtnText}>⚡ Login & Authorize Live Session</Text>
+            </TouchableOpacity>
+            
             <TouchableOpacity style={styles.deleteBtn} onPress={() => deleteCredentials(configuredBroker.id)}>
               <Text style={styles.deleteBtnText}>Delete API Credentials</Text>
             </TouchableOpacity>
@@ -160,6 +178,13 @@ export default function SettingsScreen({ session }) {
               <Text style={styles.pickerText}>Flattrade (Default)</Text>
             </View>
             
+            <TextInput 
+              style={styles.input} 
+              placeholder="Client ID (e.g. FCCOM623)" 
+              placeholderTextColor="#6b7280"
+              value={clientId}
+              onChangeText={setClientId}
+            />
             <TextInput 
               style={styles.input} 
               placeholder="API Key" 
@@ -324,6 +349,21 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: '#9ca3af',
     marginBottom: 16,
+  },
+  authorizeBtn: {
+    backgroundColor: 'rgba(16, 185, 129, 0.12)',
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  authorizeBtnText: {
+    color: '#10b981',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
   deleteBtn: {
     backgroundColor: 'rgba(239, 68, 68, 0.15)',

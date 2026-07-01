@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from backend.database import init_db, get_db, Signal, Position, DailyConsent, User
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
+from backend.flattrade_client import place_flattrade_order, exchange_request_code
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 # Initialize FastAPI App
 app = FastAPI(title="GuruDevaDatta Trading App Backend", version="1.0.0")
@@ -563,6 +565,24 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     else:
         exit_price = index_exit_price
         
+    if pos.real_or_paper.upper() == "LIVE":
+        from backend.credentials import AppCredentialsManager
+        mgr = AppCredentialsManager(db, user_id=pos.user_id)
+        active_broker = mgr.get_active_broker()
+        if active_broker == "flattrade":
+            opp_direction = "SHORT" if pos.direction == "LONG" else "LONG"
+            res = place_flattrade_order(
+                user_id=pos.user_id,
+                symbol=pos.symbol,
+                direction=opp_direction,
+                qty=pos.qty,
+                price=exit_price,
+                db=db,
+                trade_type=pos.trade_type or "INTRADAY"
+            )
+            if res.get("status") == "error":
+                raise Exception(res.get("message"))
+        
     pos.exit_price = round(exit_price, 2)
     pos.exit_time = get_ist_time()
     pos.status = "CLOSED"
@@ -576,7 +596,24 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
 
 
 def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, 
-                       user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER", trade_type: str = "INTRADAY") -> Position:
+                        user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER", trade_type: str = "INTRADAY") -> Position:
+    if real_or_paper.upper() == "LIVE":
+        from backend.credentials import AppCredentialsManager
+        mgr = AppCredentialsManager(db, user_id=user_id)
+        active_broker = mgr.get_active_broker()
+        if active_broker == "flattrade":
+            res = place_flattrade_order(
+                user_id=user_id,
+                symbol=symbol,
+                direction=direction,
+                qty=qty,
+                price=entry_price,
+                db=db,
+                trade_type=trade_type
+            )
+            if res.get("status") == "error":
+                raise Exception(res.get("message"))
+                
     new_pos = Position(
         user_id=user_id,
         symbol=symbol,
@@ -591,6 +628,21 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
     )
     db.add(new_pos)
     return new_pos
+
+def safe_open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, 
+                             user_id: int, timeframe: str, real_or_paper: str, trade_type: str, trade_log: list, success_msg: str):
+    try:
+        open_position_entry(symbol, direction, entry_price, qty, db, user_id=user_id, timeframe=timeframe, real_or_paper=real_or_paper, trade_type=trade_type)
+        trade_log.append(success_msg)
+    except Exception as ex:
+        trade_log.append(f"User {user_id}: Failed to open {direction} position for {symbol} in {real_or_paper} mode: {ex}")
+
+def safe_close_position_entry(pos: Position, index_exit_price: float, db: Session, trade_log: list, success_msg_template: str):
+    try:
+        pnl = close_position_entry(pos, index_exit_price, db)
+        trade_log.append(success_msg_template.format(pnl=pnl, exit_price=pos.exit_price))
+    except Exception as ex:
+        trade_log.append(f"User {pos.user_id}: Failed to close {pos.direction} position on {pos.symbol} in {pos.real_or_paper} mode: {ex}")
 
 # Helper to determine qty and lot size based on symbol rules
 def calculate_trade_qty(symbol: str) -> float:
@@ -1032,8 +1084,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
             if user_open_positions:
                 for p in user_open_positions:
-                    pnl = close_position_entry(p, price_val, db)
-                    trade_log.append(f"User {user.id}: Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
                 
                 if not is_explicit_long_entry:
                     trade_log.append(f"User {user.id}: Covered SHORT position on {symbol_norm} (flat)")
@@ -1042,24 +1093,20 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 if is_futures_alert:
                     # Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
+                    safe_open_position_entry(symbol_norm, "LONG", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                 else:
                     if is_option_signal:
                         qty = calculate_trade_qty(underlying_norm)
-                        open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     else:
                         # Standard signal (e.g. NIFTY) -> Trade Option
                         if opt_symbol and opt_premium:
                             qty = calculate_trade_qty(underlying_norm)
-                            open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                            trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                            safe_open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                         else:
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
-                            open_position_entry(symbol_norm, "LONG", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                            trade_log.append(f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
+                            safe_open_position_entry(symbol_norm, "LONG", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
@@ -1072,8 +1119,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
             if user_open_positions:
                 for p in user_open_positions:
-                    pnl = close_position_entry(p, price_val, db)
-                    trade_log.append(f"User {user.id}: Closed existing {p.direction} position on {p.symbol} (P&L: {pnl})")
+                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
                 
                 if not is_explicit_short_entry:
                     trade_log.append(f"User {user.id}: Exited LONG position on {symbol_norm} (flat)")
@@ -1082,24 +1128,20 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 if is_futures_alert:
                     # Open Future position
                     qty = calculate_trade_qty(symbol_norm)
-                    open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                    trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
+                    safe_open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                 else:
                     if is_option_signal:
                         qty = calculate_trade_qty(underlying_norm)
-                        open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                        trade_log.append(f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                     else:
                         # Standard signal (e.g. NIFTY) -> Trade Option (PE is bought, direction is LONG)
                         if opt_symbol and opt_premium:
                             qty = calculate_trade_qty(underlying_norm)
-                            open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                            trade_log.append(f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                            safe_open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
                         else:
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
-                            open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user_id=user.id, timeframe=timeframe_str, real_or_paper=mode_val, trade_type=trade_type_val)
-                            trade_log.append(f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
+                            safe_open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                     
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
             if user_open_positions:
@@ -1114,8 +1156,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                         should_close = True
                         
                     if should_close:
-                        pnl = close_position_entry(p, price_val, db)
-                        trade_log.append(f"User {user.id}: Exited {p.direction} position on {p.symbol} at {p.exit_price} (P&L: {pnl})")
+                        safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})")
             else:
                 trade_log.append(f"User {user.id}: Received exit signal for {symbol_norm} but no open position existed")
         processed_users_count += 1
@@ -1600,6 +1641,79 @@ def delete_credentials(broker_id: str, db: Session = Depends(get_db), user: User
         return {"status": "success", "broker_id": broker_id}
     raise HTTPException(status_code=404, detail="Credentials not found")
 
+@app.get("/api/broker/callback")
+def broker_callback(code: str, db: Session = Depends(get_db)):
+    mgr = AppCredentialsManager(db, user_id=1)
+    creds = mgr.load_credentials("flattrade")
+    if not creds:
+        return HTMLResponse(content="<h2>Error: Flattrade credentials are not configured in the app yet. Please configure them first under settings.</h2>", status_code=400)
+    
+    api_key = creds.get("api_key")
+    api_secret = creds.get("api_secret")
+    
+    token = exchange_request_code(api_key, api_secret, code)
+    if not token:
+        return HTMLResponse(content="<h2>Error: Failed to exchange request code for session token. Please verify your static IP and credentials.</h2>", status_code=400)
+        
+    today_str = get_ist_time().date().isoformat()
+    extra_fields = creds.get("extra", {}) or {}
+    extra_fields["token"] = token
+    extra_fields["token_date"] = today_str
+    
+    mgr.save_credentials("flattrade", api_key, api_secret, extra=extra_fields)
+    
+    html_content = """
+    <html>
+        <head>
+            <title>Auth Success</title>
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #111827; color: #f3f4f6; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                .card { background-color: #1f2937; padding: 2.5rem; border-radius: 12px; border: 1px solid #374151; text-align: center; max-width: 480px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); }
+                h1 { color: #10b981; margin-top: 0; }
+                p { color: #9ca3af; line-height: 1.5; font-size: 1.1rem; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>Login Successful!</h1>
+                <p>Your Flattrade Pi API daily session has been successfully authorized and linked to SKI Analytics.</p>
+                <p>You can close this tab and return to the app.</p>
+            </div>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.get("/api/broker/login/{broker_id}")
+def broker_login_redirect(broker_id: str, token: str = Query(None), db: Session = Depends(get_db)):
+    user = None
+    if token:
+        user_info = get_user_from_token(token)
+        if user_info:
+            supabase_uid = user_info.get("id")
+            user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
+            
+    if not user:
+        user = db.query(User).filter(User.id == 1).first()
+        
+    if not user:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+        
+    if broker_id != "flattrade":
+        raise HTTPException(status_code=400, detail="Only Flattrade is supported for login redirection")
+        
+    mgr = AppCredentialsManager(db, user_id=user.id)
+    creds = mgr.load_credentials("flattrade")
+    if not creds:
+        raise HTTPException(status_code=400, detail="Flattrade credentials not configured. Please save them first.")
+        
+    api_key = creds.get("api_key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API Key not found in Flattrade credentials")
+        
+    auth_url = f"https://auth.flattrade.in/?app_key={api_key}"
+    return RedirectResponse(url=auth_url)
+
 @app.get("/api/user")
 def get_user_profile(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     trial_days_left = 5
@@ -1780,6 +1894,21 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         entry_price = get_live_market_price(signal.symbol) or signal.price
         direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
         
+    if req.mode.upper() == "LIVE":
+        active_broker = mgr.get_active_broker()
+        if active_broker == "flattrade":
+            res = place_flattrade_order(
+                user_id=user.id,
+                symbol=trade_symbol,
+                direction=direction,
+                qty=qty,
+                price=entry_price,
+                db=db,
+                trade_type=signal.trade_type
+            )
+            if res.get("status") == "error":
+                raise HTTPException(status_code=400, detail=f"Flattrade API Order Failed: {res.get('message')}")
+        
     # Create the position
     new_pos = Position(
         user_id=user.id,
@@ -1821,8 +1950,11 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
         latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
         index_exit_price = latest_signal.price if latest_signal else pos.entry_price
         
-    close_position_entry(pos, index_exit_price, db)
-    db.commit()
+    try:
+        close_position_entry(pos, index_exit_price, db)
+        db.commit()
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=f"Broker Exit Failed: {str(ex)}")
     return {"status": "success", "pnl": pos.pnl}
 
 @app.post("/api/admin/purge-test-data")

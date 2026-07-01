@@ -362,17 +362,32 @@ function loadBrokerCredentials() {
             
             container.innerHTML = `
                 <h5 class="mt-2" style="font-size: 12px; font-weight:700;">Linked Accounts:</h5>
-                ` + configured.map(b => `
-                    <div class="configured-broker-badge">
-                        <div>
-                            <strong>${b.name}</strong>
-                            <div style="font-size: 10px; color: var(--text-muted);">${b.info.api_key_masked}</div>
+                ` + configured.map(b => {
+                    let authBtn = '';
+                    if (b.id === 'flattrade') {
+                        authBtn = `
+                            <div class="mt-1" style="width: 100%;">
+                                <a href="${API_BASE}/api/broker/login/flattrade" target="_blank" class="action-btn btn-small" style="display: block; text-align: center; text-decoration: none; background: #10b981; color: white; padding: 6px; border-radius: 4px; font-size: 11px; font-weight: bold; border: none;">
+                                    ⚡ Login & Authorize Live Session
+                                </a>
+                             </div>
+                        `;
+                    }
+                    return `
+                        <div class="configured-broker-badge" style="flex-wrap: wrap;">
+                            <div style="flex: 1; display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                                <div>
+                                    <strong>${b.name}</strong>
+                                    <div style="font-size: 10px; color: var(--text-muted);">${b.info.api_key_masked}</div>
+                                </div>
+                                <button class="del-cred-btn" onclick="deleteBrokerCredentials('${b.id}')">
+                                    <i class="fa-regular fa-trash-can"></i>
+                                </button>
+                            </div>
+                            ${authBtn}
                         </div>
-                        <button class="del-cred-btn" onclick="deleteBrokerCredentials('${b.id}')">
-                            <i class="fa-regular fa-trash-can"></i>
-                        </button>
-                    </div>
-                `).join('');
+                    `;
+                }).join('');
         })
         .catch(err => console.error("Error loading broker creds: ", err));
 }
@@ -380,9 +395,14 @@ function loadBrokerCredentials() {
 // Save Broker Credentials
 function saveCredentials() {
     const broker_id = document.getElementById("broker-select").value;
+    const client_id = document.getElementById("client-id-input") ? document.getElementById("client-id-input").value : "";
     const api_key = document.getElementById("api-key-input").value;
     const api_secret = document.getElementById("api-secret-input").value;
     
+    if (broker_id === "flattrade" && !client_id) {
+        alert("Please enter your Client ID.");
+        return;
+    }
     if (!api_key || !api_secret) {
         alert("Please enter API Key and Secret.");
         return;
@@ -395,13 +415,16 @@ function saveCredentials() {
             broker_id: broker_id,
             api_key: api_key,
             api_secret: api_secret,
-            extra: {}
+            extra: {
+                client_id: client_id
+            }
         })
     })
     .then(res => res.json())
     .then(() => {
         logAdmin(`Successfully saved api credentials for ${broker_id}`, "success");
         // Clear fields
+        if (document.getElementById("client-id-input")) document.getElementById("client-id-input").value = "";
         document.getElementById("api-key-input").value = "";
         document.getElementById("api-secret-input").value = "";
         loadBrokerCredentials();
