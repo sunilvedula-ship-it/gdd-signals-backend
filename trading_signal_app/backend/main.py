@@ -1642,8 +1642,28 @@ def delete_credentials(broker_id: str, db: Session = Depends(get_db), user: User
     raise HTTPException(status_code=404, detail="Credentials not found")
 
 @app.get("/api/broker/callback")
-def broker_callback(code: str, db: Session = Depends(get_db)):
-    mgr = AppCredentialsManager(db, user_id=1)
+def broker_callback(code: str, client: str = Query(None), db: Session = Depends(get_db)):
+    from backend.database import BrokerCredential
+    from backend.credentials import deobfuscate
+    import json
+    
+    creds_list = db.query(BrokerCredential).filter(BrokerCredential.broker_id == "flattrade").all()
+    target_user_id = None
+    
+    if client:
+        for c in creds_list:
+            try:
+                extra = json.loads(deobfuscate(c.extra_fields)) if c.extra_fields else {}
+                if extra.get("client_id") == client:
+                    target_user_id = c.user_id
+                    break
+            except Exception:
+                continue
+                
+    if not target_user_id:
+        target_user_id = creds_list[0].user_id if creds_list else 1
+        
+    mgr = AppCredentialsManager(db, user_id=target_user_id)
     creds = mgr.load_credentials("flattrade")
     if not creds:
         return HTMLResponse(content="<h2>Error: Flattrade credentials are not configured in the app yet. Please configure them first under settings.</h2>", status_code=400)
