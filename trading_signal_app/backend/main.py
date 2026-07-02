@@ -1671,9 +1671,13 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
     api_key = creds.get("api_key")
     api_secret = creds.get("api_secret")
     
-    token = exchange_request_code(api_key, api_secret, code)
-    if not token:
-        return HTMLResponse(content="<h2>Error: Failed to exchange request code for session token. Please verify your static IP and credentials.</h2>", status_code=400)
+    try:
+        token = exchange_request_code(api_key, api_secret, code)
+    except Exception as e:
+        return HTMLResponse(
+            content=f"<h2>Error: Failed to exchange request code for session token. Please verify your static IP and credentials.</h2><p style='color: #ef4444; font-family: monospace; font-size: 14px; background: rgba(239, 68, 68, 0.1); padding: 10px; border-radius: 6px;'>Details: {str(e)}</p>",
+            status_code=400
+        )
         
     today_str = get_ist_time().date().isoformat()
     extra_fields = creds.get("extra", {}) or {}

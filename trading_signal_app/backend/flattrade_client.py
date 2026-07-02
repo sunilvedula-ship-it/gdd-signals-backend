@@ -42,28 +42,56 @@ def get_next_monthly_expiry(dt: datetime, weekday: int = 1) -> datetime:
             
     return last_dt
 
-def exchange_request_code(api_key: str, api_secret: str, request_code: str) -> Optional[str]:
+def exchange_request_code(api_key: str, api_secret: str, request_code: str) -> str:
     """Exchanges authorization request_code for the daily session token/key via SHA-256."""
+    import urllib.error
+    
+    # Create SHA-256 hash signature
+    hash_input = (api_key + request_code + api_secret).encode("utf-8")
+    hash_value = hashlib.sha256(hash_input).hexdigest()
+    
+    payload = {
+        "api_key": api_key,
+        "request_code": request_code,
+        "api_secret": hash_value
+    }
+    
+    headers = {"Content-Type": "application/json"}
+    req = urllib.request.Request(TOKEN_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    
     try:
-        # Create SHA-256 hash signature
-        hash_input = (api_key + request_code + api_secret).encode("utf-8")
-        hash_value = hashlib.sha256(hash_input).hexdigest()
-        
-        payload = {
-            "api_key": api_key,
-            "request_code": request_code,
-            "api_secret": hash_value
-        }
-        
-        headers = {"Content-Type": "application/json"}
-        req = urllib.request.Request(TOKEN_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=10) as res:
+            res_body = res.read().decode("utf-8")
             if res.getcode() == 200:
-                data = json.loads(res.read().decode("utf-8"))
-                return data.get("token")
+                data = json.loads(res_body)
+                token = data.get("token")
+                if token:
+                    return token
+                
+                # Check for error msg in response body
+                emsg = data.get("emsg")
+                stat = data.get("stat")
+                if stat == "Not_Ok" or emsg:
+                    raise ValueError(f"Flattrade returned: {emsg or 'Not_Ok status'}")
+                raise ValueError(f"No token field in response: {res_body}")
+            else:
+                raise ValueError(f"HTTP status {res.getcode()}: {res_body}")
+    except urllib.error.HTTPError as he:
+        try:
+            err_body = he.read().decode("utf-8")
+            try:
+                data = json.loads(err_body)
+                if data.get("emsg"):
+                    raise ValueError(f"Flattrade error: {data['emsg']}")
+            except Exception:
+                pass
+            raise ValueError(f"HTTP {he.code}: {err_body}")
+        except Exception:
+            raise ValueError(f"HTTP {he.code} Error (Failed to read response body)")
     except Exception as e:
-        print(f"[Flattrade Error] Token exchange failed: {e}")
-    return None
+        if isinstance(e, ValueError):
+            raise e
+        raise ValueError(f"Network error: {str(e)}")
 
 def map_to_flattrade_symbol(symbol_str: str) -> str:
     """
