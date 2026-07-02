@@ -182,19 +182,25 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
         headers['Authorization'] = `Bearer ${session.access_token}`;
       }
       
+      const safeJson = async (res, label) => {
+        if (!res.ok) { console.warn(`${label} returned HTTP ${res.status}`); return null; }
+        const text = await res.text();
+        try { return JSON.parse(text); } catch { console.warn(`${label} returned non-JSON`); return null; }
+      };
+
       const response = await fetch(`${BACKEND_URL}/api/paper-trades`, { headers });
-      const data = await response.json();
-      setPositions(data.positions || []);
-      setStats(data.stats || { total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
+      const data = await safeJson(response, 'paper-trades');
+      if (data) {
+        setPositions(data.positions || []);
+        setStats(data.stats || { total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
+      }
 
       // Fetch settings for muted symbols
       const settingsRes = await fetch(`${BACKEND_URL}/api/user/settings`, { headers });
-      if (settingsRes.ok) {
-        const settingsData = await settingsRes.json();
-        setMutedSymbols(settingsData.muted_symbols || []);
-      }
+      const settingsData = await safeJson(settingsRes, 'user/settings');
+      if (settingsData) setMutedSymbols(settingsData.muted_symbols || []);
     } catch (error) {
-      console.error("Error loading paper trades:", error);
+      console.warn("Error loading paper trades:", error.message);
     } finally {
       setLoading(false);
     }
@@ -232,11 +238,13 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
         headers,
         body: JSON.stringify({ symbol: sym, mute: newMuteStatus })
       });
-      const data = await response.json();
-      if (response.ok) {
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (response.ok && data) {
         setMutedSymbols(data.muted_symbols || []);
       } else {
-        alert(`Error toggling mute: ${data.detail || 'Request failed'}`);
+        alert(`Error toggling mute: ${data?.detail || 'Request failed'}`);
       }
     } catch (error) {
       alert(`Network error toggling mute: ${error.message}`);

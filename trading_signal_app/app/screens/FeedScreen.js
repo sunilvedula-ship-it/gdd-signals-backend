@@ -19,7 +19,7 @@ const formatSignalDate = (isoString) => {
   return `${day}-${month}-${year} ${hoursStr}:${minutes} ${ampm}`;
 };
 
-export default function FeedScreen({ session }) {
+export default function FeedScreen({ session, purgeTrigger }) {
   const [signals, setSignals] = useState([]);
   const [brokerStatus, setBrokerStatus] = useState({ status: 'sandbox', broker_name: 'Sandbox Broker', balance: 1000000, mode: 'SANDBOX', combined_open_pnl: 0 });
   const [positions, setPositions] = useState([]);
@@ -40,36 +40,49 @@ export default function FeedScreen({ session }) {
       if (session?.access_token) {
         headers['Authorization'] = `Bearer ${session.access_token}`;
       }
+
+      // Helper: safely parse JSON, returns null on failure
+      const safeJson = async (res, label) => {
+        if (!res.ok) {
+          console.warn(`${label} returned HTTP ${res.status}`);
+          return null;
+        }
+        const text = await res.text();
+        try {
+          return JSON.parse(text);
+        } catch {
+          console.warn(`${label} returned non-JSON:`, text.substring(0, 120));
+          return null;
+        }
+      };
       
       const response = await fetch(`${BACKEND_URL}/api/signals`, { headers });
-      const data = await response.json();
-      setSignals(data);
+      const data = await safeJson(response, 'signals');
+      if (Array.isArray(data)) setSignals(data);
       
       // Fetch broker account status
       const brokerRes = await fetch(`${BACKEND_URL}/api/broker/status`, { headers });
-      const brokerData = await brokerRes.json();
-      setBrokerStatus(brokerData);
+      const brokerData = await safeJson(brokerRes, 'broker/status');
+      if (brokerData) setBrokerStatus(brokerData);
       
       // Fetch positions (to check active trade running on signal_id)
       const positionsRes = await fetch(`${BACKEND_URL}/api/paper-trades`, { headers });
-      const positionsData = await positionsRes.json();
-      setPositions(positionsData.positions || []);
+      const positionsData = await safeJson(positionsRes, 'paper-trades');
+      if (positionsData) setPositions(positionsData.positions || []);
 
       // Fetch settings for muted symbols
       const settingsRes = await fetch(`${BACKEND_URL}/api/user/settings`, { headers });
-      if (settingsRes.ok) {
-        const settingsData = await settingsRes.json();
-        setMutedSymbols(settingsData.muted_symbols || []);
-      }
+      const settingsData = await safeJson(settingsRes, 'user/settings');
+      if (settingsData) setMutedSymbols(settingsData.muted_symbols || []);
 
       // Fetch daily consent status
       const consentRes = await fetch(`${BACKEND_URL}/api/consent`, { headers });
-      if (consentRes.ok) {
-        const consentData = await consentRes.json();
+      const consentData = await safeJson(consentRes, 'consent');
+      if (consentData && consentData.consent_signed !== undefined) {
         setConsentSigned(consentData.consent_signed);
       }
     } catch (error) {
-      console.error("Error loading signals & broker info:", error);
+      console.warn("Network error loading signals & broker info:", error.message);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -82,6 +95,14 @@ export default function FeedScreen({ session }) {
     const timer = setInterval(fetchSignals, 5000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (purgeTrigger > 0) {
+      setSignals([]);
+      setPositions([]);
+      fetchSignals();
+    }
+  }, [purgeTrigger]);
 
   const onRefresh = () => {
     setRefreshing(true);
@@ -129,12 +150,14 @@ export default function FeedScreen({ session }) {
           lots: lots
         })
       });
-      const resData = await response.json();
-      if (response.ok) {
+      const text = await response.text();
+      let resData;
+      try { resData = JSON.parse(text); } catch { resData = null; }
+      if (response.ok && resData) {
         alert(`Success: Order executed for ${resData.symbol}. Traded ${lots} Lots (${resData.qty} Qty) in ${resData.mode} mode!`);
         fetchSignals();
       } else {
-        alert(`Error: ${resData.detail || 'Order execution failed'}`);
+        alert(`Error: ${resData?.detail || 'Order execution failed'}`);
       }
     } catch (error) {
       alert(`Network error: ${error.message}`);
@@ -182,11 +205,13 @@ export default function FeedScreen({ session }) {
         headers,
         body: JSON.stringify({ symbol: sym, mute: newMuteStatus })
       });
-      const data = await response.json();
-      if (response.ok) {
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (response.ok && data) {
         setMutedSymbols(data.muted_symbols || []);
       } else {
-        alert(`Error toggling mute: ${data.detail || 'Request failed'}`);
+        alert(`Error toggling mute: ${data?.detail || 'Request failed'}`);
       }
     } catch (error) {
       alert(`Network error toggling mute: ${error.message}`);
@@ -260,6 +285,24 @@ export default function FeedScreen({ session }) {
             {item.timeframe && (
               <View style={[styles.badge, styles.badgeTimeframe, { marginRight: 6 }]}>
                 <Text style={styles.badgeText}>⏱ {item.timeframe}</Text>
+              </View>
+            )}
+            {item.trade_type && (
+              <View style={[
+                styles.badge, 
+                { 
+                  backgroundColor: item.trade_type === 'POSITIONAL' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(16, 185, 129, 0.12)', 
+                  borderColor: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981', 
+                  borderWidth: 1, 
+                  marginRight: 6 
+                }
+              ]}>
+                <Text style={[
+                  styles.badgeText, 
+                  { color: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981', fontSize: 9 }
+                ]}>
+                  {item.trade_type}
+                </Text>
               </View>
             )}
             {isMuted && (

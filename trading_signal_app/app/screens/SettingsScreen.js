@@ -41,14 +41,16 @@ export default function SettingsScreen({ session, onPurge }) {
         method: 'POST',
         headers
       });
-      const data = await response.json();
-      if (response.ok) {
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (response.ok && data) {
         if (onPurge) {
           onPurge();
         }
         Alert.alert("Purge Successful", `Database cleaned successfully.\n- Signals Deleted: ${data.purged_signals}\n- Positions Deleted: ${data.purged_positions}`);
       } else {
-        Alert.alert("Purge Failed", data.detail || "Could not clear data.");
+        Alert.alert("Purge Failed", data?.detail || "Could not clear data.");
       }
     } catch (error) {
       Alert.alert("Network Error", error.message);
@@ -64,10 +66,13 @@ export default function SettingsScreen({ session, onPurge }) {
         headers['Authorization'] = `Bearer ${session.access_token}`;
       }
       const response = await fetch(`${BACKEND_URL}/api/credentials`, { headers });
-      const data = await response.json();
-      setBrokers(data.brokers);
+      if (!response.ok) { console.warn('credentials returned HTTP', response.status); return; }
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { console.warn('credentials returned non-JSON'); return; }
+      if (data) setBrokers(data.brokers);
     } catch (error) {
-      console.error("Error loading credentials:", error);
+      console.warn("Error loading credentials:", error.message);
     } finally {
       setLoading(false);
     }

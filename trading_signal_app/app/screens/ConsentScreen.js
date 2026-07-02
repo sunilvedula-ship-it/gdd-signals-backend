@@ -14,10 +14,13 @@ export default function ConsentScreen({ session }) {
         headers['Authorization'] = `Bearer ${session.access_token}`;
       }
       const response = await fetch(`${BACKEND_URL}/api/consent`, { headers });
-      const data = await response.json();
-      setConsentSigned(data.consent_signed);
+      if (!response.ok) { console.warn('consent returned HTTP', response.status); return; }
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { console.warn('consent returned non-JSON'); return; }
+      if (data) setConsentSigned(data.consent_signed);
     } catch (error) {
-      console.error("Error loading consent:", error);
+      console.warn("Error loading consent:", error.message);
     } finally {
       setLoading(false);
     }
@@ -35,12 +38,14 @@ export default function ConsentScreen({ session }) {
         headers,
         body: JSON.stringify({ agreement_version: "v1.0" })
       });
-      const data = await response.json();
-      if (data.status === 'success') {
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (data && data.status === 'success') {
         setConsentSigned(true);
       }
     } catch (error) {
-      console.error("Error signing consent:", error);
+      console.warn("Error signing consent:", error.message);
     } finally {
       setLoading(false);
     }
