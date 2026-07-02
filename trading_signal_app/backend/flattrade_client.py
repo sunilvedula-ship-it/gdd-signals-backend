@@ -10,6 +10,22 @@ from sqlalchemy.orm import Session
 TOKEN_URL = "https://authapi.flattrade.in/trade/apitoken"
 PLACE_ORDER_URL = "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder"
 
+def send_api_request(url: str, data_dict: dict) -> tuple[int, str]:
+    """Helper to send POST request, optionally routing through a proxy if configured."""
+    headers = {"Content-Type": "application/json"}
+    data_bytes = json.dumps(data_dict).encode("utf-8")
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    
+    proxy_url = os.environ.get("PROXY_URL") or os.environ.get("QUOTAGUARDSTATIC_URL") or os.environ.get("FIXIE_URL")
+    if proxy_url:
+        proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
+        opener = urllib.request.build_opener(proxy_handler)
+        with opener.open(req, timeout=10) as res:
+            return res.getcode(), res.read().decode("utf-8")
+    else:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return res.getcode(), res.read().decode("utf-8")
+
 def get_ist_time() -> datetime:
     from datetime import timezone, timedelta
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
@@ -56,26 +72,22 @@ def exchange_request_code(api_key: str, api_secret: str, request_code: str) -> s
         "api_secret": hash_value
     }
     
-    headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(TOKEN_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-    
     try:
-        with urllib.request.urlopen(req, timeout=10) as res:
-            res_body = res.read().decode("utf-8")
-            if res.getcode() == 200:
-                data = json.loads(res_body)
-                token = data.get("token")
-                if token:
-                    return token
-                
-                # Check for error msg in response body
-                emsg = data.get("emsg")
-                stat = data.get("stat")
-                if stat == "Not_Ok" or emsg:
-                    raise ValueError(f"Flattrade returned: {emsg or 'Not_Ok status'}")
-                raise ValueError(f"No token field in response: {res_body}")
-            else:
-                raise ValueError(f"HTTP status {res.getcode()}: {res_body}")
+        status_code, res_body = send_api_request(TOKEN_URL, payload)
+        if status_code == 200:
+            data = json.loads(res_body)
+            token = data.get("token")
+            if token:
+                return token
+            
+            # Check for error msg in response body
+            emsg = data.get("emsg")
+            stat = data.get("stat")
+            if stat == "Not_Ok" or emsg:
+                raise ValueError(f"Flattrade returned: {emsg or 'Not_Ok status'}")
+            raise ValueError(f"No token field in response: {res_body}")
+        else:
+            raise ValueError(f"HTTP status {status_code}: {res_body}")
     except urllib.error.HTTPError as he:
         try:
             err_body = he.read().decode("utf-8")
@@ -191,25 +203,20 @@ def place_flattrade_order(user_id: int, symbol: str, direction: str, qty: float,
     }
     
     try:
-        headers = {"Content-Type": "application/json"}
-        req = urllib.request.Request(PLACE_ORDER_URL, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as res:
-            response_code = res.getcode()
-            response_body = res.read().decode("utf-8")
-            
-            if response_code == 200:
-                data = json.loads(response_body)
-                if data.get("stat") == "Ok":
-                    return {
-                        "status": "success",
-                        "order_id": data.get("norenordno"),
-                        "symbol": tsym,
-                        "qty": qty,
-                        "price": price
-                    }
-                else:
-                    return {"status": "error", "message": data.get("emsg", "Flattrade returned failure status")}
+        response_code, response_body = send_api_request(PLACE_ORDER_URL, payload)
+        if response_code == 200:
+            data = json.loads(response_body)
+            if data.get("stat") == "Ok":
+                return {
+                    "status": "success",
+                    "order_id": data.get("norenordno"),
+                    "symbol": tsym,
+                    "qty": qty,
+                    "price": price
+                }
             else:
-                return {"status": "error", "message": f"HTTP status code {response_code}"}
+                return {"status": "error", "message": data.get("emsg", "Flattrade returned failure status")}
+        else:
+            return {"status": "error", "message": f"HTTP status code {response_code}"}
     except Exception as e:
         return {"status": "error", "message": f"Network / API connection error: {e}"}
