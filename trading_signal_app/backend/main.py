@@ -1838,6 +1838,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
             Position.user_id == user.id,
+            Position.real_or_paper == req.mode,
             (Position.symbol.like("% CE") | Position.symbol.like("% PE") | Position.symbol.like("%CE%") | Position.symbol.like("%PE%"))
         ).first()
     else:
@@ -1845,6 +1846,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
             Position.user_id == user.id,
+            Position.real_or_paper == req.mode,
             ~Position.symbol.like("% CE"),
             ~Position.symbol.like("% PE"),
             ~Position.symbol.like("%CE%"),
