@@ -1,19 +1,156 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator, TextInput } from 'react-native';
 import { BACKEND_URL } from '../config';
 
-export default function PaperTradeScreen({ session }) {
+const formatSignalDate = (isoString) => {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return '';
+  const day = String(date.getDate()).padStart(2, '0');
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const month = months[date.getMonth()];
+  const year = date.getFullYear();
+  let hours = date.getHours();
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const ampm = hours >= 12 ? 'PM' : 'AM';
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+  const hoursStr = String(hours).padStart(2, '0');
+  return `${day}-${month}-${year} ${hoursStr}:${minutes} ${ampm}`;
+};
+
+const getNormalizedBaseSymbol = (symbol) => {
+  let sym = (symbol || '').toUpperCase().trim();
+  if (sym.includes(':')) {
+    sym = sym.split(':').pop();
+  }
+  const parts = sym.split(/\s+/);
+  if (parts.length >= 3 && ['CE', 'PE'].includes(parts[parts.length - 1])) {
+    sym = parts[0];
+  }
+  if (sym.endsWith('1!')) {
+    sym = sym.slice(0, -2);
+  } else if (sym.endsWith('!')) {
+    sym = sym.slice(0, -1);
+  }
+  if (sym.includes('XAU') || sym.includes('GOLD')) return 'GOLD';
+  if (sym.includes('SILVER')) return 'SILVER';
+  if (sym.includes('BANKNIFTY') || sym.includes('BNF')) return 'BANKNIFTY';
+  if (sym.includes('NIFTY')) return 'NIFTY';
+  if (sym.includes('SENSEX') || sym.includes('BSX')) return 'SENSEX';
+  if (sym.includes('CRUDE')) return 'CRUDEOIL';
+  return sym;
+};
+
+const getLotSize = (symbol) => {
+  const sym = (symbol || '').toUpperCase();
+  if (sym.includes('BANKNIFTY')) return 30;
+  if (sym.includes('NIFTY')) return 65;
+  if (sym.includes('SENSEX')) return 20;
+  if (sym.includes('CRUDE')) return 100;
+  if (sym.includes('GOLD')) return 100;
+  if (sym.includes('WIPRO')) return 1500;
+  if (sym.includes('RELIANCE')) return 250;
+  if (sym.includes('TITAN')) return 375;
+  if (sym.includes('BAJFINSERV')) return 500;
+  if (sym.includes('ADANIPORTS')) return 625;
+  return 100;
+};
+
+const isCryptoAsset = (symbol) => {
+  const sym = (symbol || '').toUpperCase();
+  return sym.includes('BTC') || sym.includes('ETH') || sym.includes('SOL') || sym.includes('USD') || sym.includes('USDT');
+};
+
+const getSubgroup = (symbol) => {
+  const sym = (symbol || '').toUpperCase();
+  const isOption = sym.endsWith(' CE') || sym.endsWith(' PE') || sym.includes(' CE') || sym.includes(' PE');
+  const isIndex = sym.includes('NIFTY') || sym.includes('SENSEX') || sym.includes('BSX');
+  const isCommodity = sym.includes('GOLD') || sym.includes('CRUDE') || sym.includes('SILVER');
+  const isCrypto = isCryptoAsset(symbol);
+  
+  if (isOption) {
+    if (isIndex) return 'Index Options';
+    if (isCommodity) return 'Gold/Crude Options';
+    return 'Stock Options';
+  } else {
+    if (isCrypto) return 'Crypto Futures';
+    if (isIndex) return 'Index Futures';
+    if (isCommodity) return 'Gold/Crude Futures';
+    return 'Stock Futures';
+  }
+};
+
+const getSourceGroup = (item) => {
+  if (item.real_or_paper === 'LIVE') return 'Live Broker Trades';
+  if (item.signal_id !== null && item.signal_id !== undefined) return 'Manual Paper Trades';
+  return 'Auto Paper Trades';
+};
+
+const calculatePnLSum = (items) => {
+  let inrSum = 0;
+  let usdSum = 0;
+  items.forEach(it => {
+    if (isCryptoAsset(it.symbol)) {
+      usdSum += it.pnl || 0;
+    } else {
+      inrSum += it.pnl || 0;
+    }
+  });
+  return { inr: inrSum, usd: usdSum };
+};
+
+const getGroupedHistory = (closedPos) => {
+  const grouped = {};
+  closedPos.forEach(item => {
+    const exitDateStr = item.exit_time ? item.exit_time.split('T')[0] : 'Unknown Date';
+    const source = getSourceGroup(item);
+    const sub = getSubgroup(item.symbol);
+    
+    if (!grouped[exitDateStr]) {
+      grouped[exitDateStr] = {};
+    }
+    if (!grouped[exitDateStr][source]) {
+      grouped[exitDateStr][source] = {};
+    }
+    if (!grouped[exitDateStr][source][sub]) {
+      grouped[exitDateStr][source][sub] = [];
+    }
+    grouped[exitDateStr][source][sub].push(item);
+  });
+  return grouped;
+};
+
+export default function PaperTradeScreen({ session, purgeTrigger }) {
   const [positions, setPositions] = useState([]);
   const [stats, setStats] = useState({ total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
   const [mutedSymbols, setMutedSymbols] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('active');
+  const [searchText, setSearchText] = useState('');
+  const [selectedSourceFilter, setSelectedSourceFilter] = useState('ALL');
 
   const [collapsedDates, setCollapsedDates] = useState({});
   const [collapsedSources, setCollapsedSources] = useState({});
   const [collapsedSubgroups, setCollapsedSubgroups] = useState({});
 
   const filteredPositions = positions.filter(pos => {
+    // 1. Symbol Search Filter (matches symbol name case-insensitively)
+    if (searchText.trim() !== '') {
+      const q = searchText.toLowerCase().trim();
+      const sym = (pos.symbol || '').toLowerCase();
+      if (!sym.includes(q)) return false;
+    }
+    
+    // 2. Source Filter (applied on history tab)
+    if (activeTab === 'history') {
+      const srcGroup = getSourceGroup(pos);
+      if (selectedSourceFilter === 'AUTO' && srcGroup !== 'Auto Paper Trades') return false;
+      if (selectedSourceFilter === 'MANUAL' && srcGroup !== 'Manual Paper Trades') return false;
+      if (selectedSourceFilter === 'LIVE' && srcGroup !== 'Live Broker Trades') return false;
+    }
+
+    // 3. Tab Filter (Active vs History)
     if (activeTab === 'active') {
       if (pos.status === 'OPEN') return true;
       if (pos.status === 'CLOSED' && pos.exit_time) {
@@ -28,6 +165,15 @@ export default function PaperTradeScreen({ session }) {
       return pos.status === 'CLOSED';
     }
   });
+
+  const filteredClosedPositions = filteredPositions.filter(p => p.status === 'CLOSED');
+  const filteredPnL = calculatePnLSum(filteredClosedPositions);
+
+  const handleTabChange = (tab) => {
+    setActiveTab(tab);
+    setSearchText('');
+    setSelectedSourceFilter('ALL');
+  };
 
   const fetchPaperTrades = async () => {
     try {
@@ -70,29 +216,6 @@ export default function PaperTradeScreen({ session }) {
     }
   };
 
-  const getNormalizedBaseSymbol = (symbol) => {
-    let sym = (symbol || '').toUpperCase().trim();
-    if (sym.includes(':')) {
-      sym = sym.split(':').pop();
-    }
-    const parts = sym.split(/\s+/);
-    if (parts.length >= 3 && ['CE', 'PE'].includes(parts[parts.length - 1])) {
-      sym = parts[0];
-    }
-    if (sym.endsWith('1!')) {
-      sym = sym.slice(0, -2);
-    } else if (sym.endsWith('!')) {
-      sym = sym.slice(0, -1);
-    }
-    if (sym.includes('XAU') || sym.includes('GOLD')) return 'GOLD';
-    if (sym.includes('SILVER')) return 'SILVER';
-    if (sym.includes('BANKNIFTY') || sym.includes('BNF')) return 'BANKNIFTY';
-    if (sym.includes('NIFTY')) return 'NIFTY';
-    if (sym.includes('SENSEX') || sym.includes('BSX')) return 'SENSEX';
-    if (sym.includes('CRUDE')) return 'CRUDEOIL';
-    return sym;
-  };
-
   const handleToggleMute = async (symbol) => {
     const sym = getNormalizedBaseSymbol(symbol);
     const isCurrentlyMuted = mutedSymbols.includes(sym);
@@ -126,88 +249,13 @@ export default function PaperTradeScreen({ session }) {
     return () => clearInterval(timer);
   }, []);
 
-  const getLotSize = (symbol) => {
-    const sym = (symbol || '').toUpperCase();
-    if (sym.includes('BANKNIFTY')) return 30;
-    if (sym.includes('NIFTY')) return 65;
-    if (sym.includes('SENSEX')) return 20;
-    if (sym.includes('CRUDE')) return 100;
-    if (sym.includes('GOLD')) return 100;
-    if (sym.includes('WIPRO')) return 1500;
-    if (sym.includes('RELIANCE')) return 250;
-    if (sym.includes('TITAN')) return 375;
-    if (sym.includes('BAJFINSERV')) return 500;
-    if (sym.includes('ADANIPORTS')) return 625;
-    return 100;
-  };
-
-  const isCryptoAsset = (symbol) => {
-    const sym = (symbol || '').toUpperCase();
-    return sym.includes('BTC') || sym.includes('ETH') || sym.includes('SOL') || sym.includes('USD') || sym.includes('USDT');
-  };
-
-  // Helper to categorize asset types
-  const getSubgroup = (symbol) => {
-    const sym = (symbol || '').toUpperCase();
-    const isOption = sym.endsWith(' CE') || sym.endsWith(' PE') || sym.includes(' CE') || sym.includes(' PE');
-    const isIndex = sym.includes('NIFTY') || sym.includes('SENSEX') || sym.includes('BSX');
-    const isCommodity = sym.includes('GOLD') || sym.includes('CRUDE') || sym.includes('SILVER');
-    const isCrypto = isCryptoAsset(symbol);
-    
-    if (isOption) {
-      if (isIndex) return 'Index Options';
-      if (isCommodity) return 'Gold/Crude Options';
-      return 'Stock Options';
-    } else {
-      if (isCrypto) return 'Crypto Futures';
-      if (isIndex) return 'Index Futures';
-      if (isCommodity) return 'Gold/Crude Futures';
-      return 'Stock Futures';
+  useEffect(() => {
+    if (purgeTrigger > 0) {
+      setPositions([]);
+      setStats({ total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
+      fetchPaperTrades();
     }
-  };
-
-  // Helper to identify source types
-  const getSourceGroup = (item) => {
-    if (item.real_or_paper === 'LIVE') return 'Live Broker Trades';
-    if (item.signal_id !== null && item.signal_id !== undefined) return 'Manual Paper Trades';
-    return 'Auto Paper Trades';
-  };
-
-  // Helper to calculate P&Ls for a set of items
-  const calculatePnLSum = (items) => {
-    let inrSum = 0;
-    let usdSum = 0;
-    items.forEach(it => {
-      if (isCryptoAsset(it.symbol)) {
-        usdSum += it.pnl || 0;
-      } else {
-        inrSum += it.pnl || 0;
-      }
-    });
-    return { inr: inrSum, usd: usdSum };
-  };
-
-  // Group closed positions by date, then source, then subgroup
-  const getGroupedHistory = (closedPos) => {
-    const grouped = {}; // { 'YYYY-MM-DD': { 'Source Group': { 'Subgroup': [positions] } } }
-    closedPos.forEach(item => {
-      const exitDateStr = item.exit_time ? item.exit_time.split('T')[0] : 'Unknown Date';
-      const source = getSourceGroup(item);
-      const sub = getSubgroup(item.symbol);
-      
-      if (!grouped[exitDateStr]) {
-        grouped[exitDateStr] = {};
-      }
-      if (!grouped[exitDateStr][source]) {
-        grouped[exitDateStr][source] = {};
-      }
-      if (!grouped[exitDateStr][source][sub]) {
-        grouped[exitDateStr][source][sub] = [];
-      }
-      grouped[exitDateStr][source][sub].push(item);
-    });
-    return grouped;
-  };
+  }, [purgeTrigger]);
 
   if (loading) {
     return (
@@ -292,6 +340,26 @@ export default function PaperTradeScreen({ session }) {
             </View>
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               <Text style={styles.symbol}>{item.symbol}</Text>
+              {item.timeframe && (
+                <View style={[styles.timeframeBadge, { marginRight: 6 }]}>
+                  <Text style={styles.timeframeBadgeText}>⏱ {item.timeframe}</Text>
+                </View>
+              )}
+              {item.trade_type && (
+                <View style={[
+                  styles.timeframeBadge, 
+                  { 
+                    backgroundColor: item.trade_type === 'POSITIONAL' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(16, 185, 129, 0.12)', 
+                    borderColor: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981', 
+                    borderWidth: 1, 
+                    marginRight: 6 
+                  }
+                ]}>
+                  <Text style={[styles.timeframeBadgeText, { color: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981' }]}>
+                    {item.trade_type}
+                  </Text>
+                </View>
+              )}
               <TouchableOpacity onPress={() => handleToggleMute(item.symbol)} style={{ paddingHorizontal: 4 }}>
                 <Text style={{ fontSize: 12 }}>{isMuted ? '🔕' : '🔔'}</Text>
               </TouchableOpacity>
@@ -309,10 +377,14 @@ export default function PaperTradeScreen({ session }) {
         <View style={styles.cardDetails}>
           <Text style={styles.detailText}>
             Entry: {currencySymbol}{item.entry_price.toLocaleString(locale, {minimumFractionDigits: 2})}
+            {item.entry_time && ` (${formatSignalDate(item.entry_time)})`}
             {!isClosed && item.current_price && ` | LTP: ${currencySymbol}${item.current_price.toLocaleString(locale, {minimumFractionDigits: 2})}`}
           </Text>
           {isClosed ? (
-            <Text style={styles.detailText}>Exit: {currencySymbol}{item.exit_price.toLocaleString(locale, {minimumFractionDigits: 2})}</Text>
+            <Text style={styles.detailText}>
+              Exit: {currencySymbol}{item.exit_price.toLocaleString(locale, {minimumFractionDigits: 2})}
+              {item.exit_time && ` (${formatSignalDate(item.exit_time)})`}
+            </Text>
           ) : (
             <TouchableOpacity style={styles.exitBtn} onPress={() => closePosition(item.id)}>
               <Text style={styles.exitBtnText}>MANUAL EXIT</Text>
@@ -334,11 +406,19 @@ export default function PaperTradeScreen({ session }) {
     const isProfitUsd = pnlData.usd > 0;
     const isLossUsd = pnlData.usd < 0;
 
+    const isSourceCollapsed = !!collapsedSources[`active_${groupKey}`];
+
     return (
       <View key={groupKey} style={[styles.sourceCard, { borderColor: group.accent + '25' }]}>
         {/* Source Header Banner */}
-        <View style={[styles.sourceHeader, { backgroundColor: group.accent + '0c', borderBottomColor: group.accent + '1a' }]}>
+        <TouchableOpacity 
+          style={[styles.sourceHeader, { backgroundColor: group.accent + '0c', borderBottomColor: group.accent + '1a' }]}
+          onPress={() => setCollapsedSources(prev => ({ ...prev, [`active_${groupKey}`]: !prev[`active_${groupKey}`] }))}
+        >
           <View style={styles.sourceTitleBlock}>
+            <Text style={{ fontSize: 12, color: '#9ca3af', marginRight: 6 }}>
+              {isSourceCollapsed ? '▶' : '▼'}
+            </Text>
             <View style={[styles.dotIndicator, { backgroundColor: group.accent }]} />
             <Text style={styles.sourceLabel}>{group.label}</Text>
           </View>
@@ -355,58 +435,74 @@ export default function PaperTradeScreen({ session }) {
             )}
             {!hasTrades && <Text style={styles.neutralBadge}>FLAT</Text>}
           </View>
-        </View>
+        </TouchableOpacity>
 
         {/* Dynamic Nested Subgroups */}
-        <View style={styles.sourceContent}>
-          {hasTrades ? (
-            subKeys.map(subKey => {
-              const items = group.items[subKey];
-              let subInr = 0;
-              let subUsd = 0;
-              items.forEach(it => {
-                if (isCryptoAsset(it.symbol)) {
-                  subUsd += it.pnl || 0;
-                } else {
-                  subInr += it.pnl || 0;
-                }
-              });
-              
-              const isSubProfitInr = subInr > 0;
-              const isSubLossInr = subInr < 0;
-              const isSubProfitUsd = subUsd > 0;
-              const isSubLossUsd = subUsd < 0;
+        {!isSourceCollapsed && (
+          <View style={styles.sourceContent}>
+            {hasTrades ? (
+              subKeys.map(subKey => {
+                const items = group.items[subKey];
+                let subInr = 0;
+                let subUsd = 0;
+                items.forEach(it => {
+                  if (isCryptoAsset(it.symbol)) {
+                    subUsd += it.pnl || 0;
+                  } else {
+                    subInr += it.pnl || 0;
+                  }
+                });
+                
+                const isSubProfitInr = subInr > 0;
+                const isSubLossInr = subInr < 0;
+                const isSubProfitUsd = subUsd > 0;
+                const isSubLossUsd = subUsd < 0;
 
-              return (
-                <View key={subKey} style={styles.subgroupBlock}>
-                  {/* Subgroup Label Tag */}
-                  <View style={styles.subgroupHeader}>
-                    <Text style={styles.subgroupTitle}>{subKey}</Text>
-                    <View style={styles.subgroupPnLBlock}>
-                      {subInr !== 0 && (
-                        <Text style={[styles.subgroupPnL, isSubProfitInr ? styles.textProfit : (isSubLossInr ? styles.textLoss : styles.textNeutral)]}>
-                          {isSubProfitInr ? '+' : ''}₹{subInr.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                const isSubCollapsed = !!collapsedSubgroups[`active_${groupKey}_${subKey}`];
+
+                return (
+                  <View key={subKey} style={styles.subgroupWrapper}>
+                    {/* Subgroup Label Tag */}
+                    <TouchableOpacity 
+                      style={styles.subgroupCollapseHeader}
+                      onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [`active_${groupKey}_${subKey}`]: !prev[`active_${groupKey}_${subKey}`] }))}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                        <Text style={{ fontSize: 9, color: '#6b7280', marginRight: 6 }}>
+                          {isSubCollapsed ? '▶' : '▼'}
                         </Text>
-                      )}
-                      {subUsd !== 0 && (
-                        <Text style={[styles.subgroupPnL, isSubProfitUsd ? styles.textProfit : (isSubLossUsd ? styles.textLoss : styles.textNeutral)]}>
-                          {isSubProfitUsd ? '+' : ''}${subUsd.toLocaleString('en-US', {minimumFractionDigits: 2})}
-                        </Text>
-                      )}
-                    </View>
+                        <Text style={styles.subgroupCollapseTitle}>{subKey}</Text>
+                      </View>
+                      <View style={styles.subgroupPnLBlock}>
+                        {subInr !== 0 && (
+                          <Text style={[styles.subgroupPnL, isSubProfitInr ? styles.textProfit : (isSubLossInr ? styles.textLoss : styles.textNeutral)]}>
+                            {isSubProfitInr ? '+' : ''}₹{subInr.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                          </Text>
+                        )}
+                        {subUsd !== 0 && (
+                          <Text style={[styles.subgroupPnL, isSubProfitUsd ? styles.textProfit : (isSubLossUsd ? styles.textLoss : styles.textNeutral)]}>
+                            {isSubProfitUsd ? '+' : ''}${subUsd.toLocaleString('en-US', {minimumFractionDigits: 2})}
+                          </Text>
+                        )}
+                      </View>
+                    </TouchableOpacity>
+
+                    {/* Subgroup Positions List */}
+                    {!isSubCollapsed && (
+                      <View style={styles.subgroupCollapseContent}>
+                        {items.map(item => renderPositionCard(item))}
+                      </View>
+                    )}
                   </View>
-
-                  {/* Subgroup Positions List */}
-                  {items.map(item => renderPositionCard(item))}
-                </View>
-              );
-            })
-          ) : (
-            <View style={styles.emptyGroupContent}>
-              <Text style={styles.emptyGroupText}>No active contracts.</Text>
-            </View>
-          )}
-        </View>
+                );
+              })
+            ) : (
+              <View style={styles.emptyGroupContent}>
+                <Text style={styles.emptyGroupText}>No active contracts.</Text>
+              </View>
+            )}
+          </View>
+        )}
       </View>
     );
   };
@@ -573,18 +669,73 @@ export default function PaperTradeScreen({ session }) {
         <View style={styles.tabContainer}>
           <TouchableOpacity 
             style={[styles.tabButton, activeTab === 'active' && styles.tabButtonActive]} 
-            onPress={() => setActiveTab('active')}
+            onPress={() => handleTabChange('active')}
           >
             <Text style={[styles.tabButtonText, activeTab === 'active' && styles.tabButtonTextActive]}>Active</Text>
           </TouchableOpacity>
           <TouchableOpacity 
             style={[styles.tabButton, activeTab === 'history' && styles.tabButtonActive]} 
-            onPress={() => setActiveTab('history')}
+            onPress={() => handleTabChange('history')}
           >
             <Text style={[styles.tabButtonText, activeTab === 'history' && styles.tabButtonTextActive]}>History</Text>
           </TouchableOpacity>
         </View>
       </View>
+
+      {/* Search and Filter Inputs for History Tab */}
+      {activeTab === 'history' && (
+        <View style={styles.filterBar}>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search symbol (e.g. NIFTY)..."
+            placeholderTextColor="#6b7280"
+            value={searchText}
+            onChangeText={setSearchText}
+          />
+          <View style={styles.filterButtonsRow}>
+            <TouchableOpacity 
+              style={[styles.filterBtn, selectedSourceFilter === 'ALL' && styles.filterBtnActive]}
+              onPress={() => setSelectedSourceFilter('ALL')}
+            >
+              <Text style={[styles.filterBtnText, selectedSourceFilter === 'ALL' && styles.filterBtnTextActive]}>ALL</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.filterBtn, selectedSourceFilter === 'AUTO' && styles.filterBtnActive]}
+              onPress={() => setSelectedSourceFilter('AUTO')}
+            >
+              <Text style={[styles.filterBtnText, selectedSourceFilter === 'AUTO' && styles.filterBtnTextActive]}>AUTO</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.filterBtn, selectedSourceFilter === 'MANUAL' && styles.filterBtnActive]}
+              onPress={() => setSelectedSourceFilter('MANUAL')}
+            >
+              <Text style={[styles.filterBtnText, selectedSourceFilter === 'MANUAL' && styles.filterBtnTextActive]}>MANUAL</Text>
+            </TouchableOpacity>
+            <TouchableOpacity 
+              style={[styles.filterBtn, selectedSourceFilter === 'LIVE' && styles.filterBtnActive]}
+              onPress={() => setSelectedSourceFilter('LIVE')}
+            >
+              <Text style={[styles.filterBtnText, selectedSourceFilter === 'LIVE' && styles.filterBtnTextActive]}>LIVE</Text>
+            </TouchableOpacity>
+          </View>
+          {/* Dynamic P&L Subtotals */}
+          {(searchText.trim() !== '' || selectedSourceFilter !== 'ALL') && (
+            <View style={styles.subtotalBanner}>
+              <Text style={styles.subtotalLabel}>FILTERED SUB-TOTALS:</Text>
+              <View style={{ flexDirection: 'row' }}>
+                <Text style={[styles.subtotalValue, filteredPnL.inr >= 0 ? styles.textProfit : styles.textLoss]}>
+                  {filteredPnL.inr >= 0 ? '+' : ''}₹{filteredPnL.inr.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+                </Text>
+                {filteredPnL.usd !== 0 && (
+                  <Text style={[styles.subtotalValue, { marginLeft: 10 }, filteredPnL.usd >= 0 ? styles.textProfit : styles.textLoss]}>
+                    {filteredPnL.usd >= 0 ? '+' : ''}${filteredPnL.usd.toLocaleString('en-US', {minimumFractionDigits: 2})}
+                  </Text>
+                )}
+              </View>
+            </View>
+          )}
+        </View>
+      )}
       
       {/* Main Grouped Ledger Scroll Board */}
       <ScrollView showsVerticalScrollIndicator={false} style={styles.scrollBoard}>
@@ -945,5 +1096,82 @@ const styles = StyleSheet.create({
   subgroupCollapseContent: {
     paddingHorizontal: 4,
     paddingVertical: 4,
+  },
+  timeframeBadge: {
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+    borderWidth: 1,
+    borderRadius: 4,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    marginRight: 4,
+  },
+  timeframeBadgeText: {
+    fontSize: 8,
+    fontWeight: 'bold',
+    color: '#9ca3af',
+  },
+  filterBar: {
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    borderColor: 'rgba(255, 255, 255, 0.06)',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 12,
+  },
+  searchInput: {
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: '#ffffff',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  filterButtonsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  filterBtn: {
+    flex: 1,
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingVertical: 6,
+    alignItems: 'center',
+    marginHorizontal: 2,
+  },
+  filterBtnActive: {
+    backgroundColor: '#3b82f6',
+    borderColor: '#3b82f6',
+  },
+  filterBtnText: {
+    fontSize: 9,
+    fontWeight: 'bold',
+    color: '#9ca3af',
+  },
+  filterBtnTextActive: {
+    color: '#ffffff',
+  },
+  subtotalBanner: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.06)',
+    paddingTop: 8,
+    marginTop: 8,
+  },
+  subtotalLabel: {
+    fontSize: 9,
+    fontWeight: 'bold',
+    color: '#9ca3af',
+  },
+  subtotalValue: {
+    fontSize: 11,
+    fontWeight: 'bold',
   },
 });
