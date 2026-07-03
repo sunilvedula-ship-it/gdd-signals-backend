@@ -772,10 +772,17 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         else:
             trade_type_val = "POSITIONAL" if "POSITIONAL" in trade_type_str else "INTRADAY"
     else:
-        # Infer from timeframe/interval
+        # Infer from source_name / orderId / signal_type first, then fallback to timeframe
+        hint_fields = " ".join([
+            str(payload.get("orderId") or ""),
+            str(payload.get("signal_type") or ""),
+            str(payload.get("source") or "")
+        ]).upper()
         t_lower = timeframe_str.lower()
-        if any(x in t_lower for x in ["1d", "daily", "1w", "weekly", "positional"]):
+        if "POSITIONAL" in hint_fields or any(x in t_lower for x in ["1d", "daily", "1w", "weekly", "positional"]):
             trade_type_val = "POSITIONAL"
+        elif "INTRADAY" in hint_fields or any(x in t_lower for x in ["1m", "3m", "5m", "15m", "30m", "1h"]):
+            trade_type_val = "INTRADAY"
         else:
             trade_type_val = "INTRADAY"
     
@@ -1053,13 +1060,15 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             continue
             
         # Check for open positions on this symbol or its options for this user
+        # Scoped to same trade_type so INTRADAY and POSITIONAL coexist independently
         user_open_positions = db.query(Position).filter(
             Position.user_id == user.id,
             ((Position.symbol == symbol_norm) | 
              (Position.symbol == underlying_norm) |
              (Position.symbol.like(f"{symbol_norm} %")) |
              (Position.symbol.like(f"{underlying_norm} %"))),
-            Position.status == "OPEN"
+            Position.status == "OPEN",
+            Position.trade_type == trade_type_val
         ).all()
         
         open_pos_future = next((p for p in user_open_positions if p.symbol == symbol_norm), None)
