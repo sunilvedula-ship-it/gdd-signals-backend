@@ -227,6 +227,18 @@ def init_db():
         except Exception:
             db.rollback()
 
+        # Repair signals saved by the old parser, which treated type=long/short as INTRADAY.
+        try:
+            db.execute(text("""
+                UPDATE signals
+                SET trade_type = 'POSITIONAL'
+                WHERE UPPER(COALESCE(source_name, '')) LIKE '%POSITIONAL%'
+                  AND UPPER(COALESCE(trade_type, 'INTRADAY')) != 'POSITIONAL'
+            """))
+            db.commit()
+        except Exception:
+            db.rollback()
+
         print("[DB] Successfully verified and completed all database migrations.")
     except Exception as e:
         print(f"[DB] Migration error: {e}")

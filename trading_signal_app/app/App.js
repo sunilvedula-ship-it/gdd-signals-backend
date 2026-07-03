@@ -27,6 +27,7 @@ const Tab = createBottomTabNavigator();
 export default function App() {
   const [session, setSession] = useState(null);
   const [initializing, setInitializing] = useState(true);
+  const [purgeTrigger, setPurgeTrigger] = useState(0);
 
   useEffect(() => {
     // 1. Get initial session
@@ -98,16 +99,16 @@ export default function App() {
             })}
           >
             <Tab.Screen name="Signals">
-              {props => <FeedScreen {...props} session={session} />}
+              {props => <FeedScreen {...props} session={session} purgeTrigger={purgeTrigger} />}
             </Tab.Screen>
             <Tab.Screen name="Paper Trade">
-              {props => <PaperTradeScreen {...props} session={session} />}
+              {props => <PaperTradeScreen {...props} session={session} purgeTrigger={purgeTrigger} />}
             </Tab.Screen>
             <Tab.Screen name="Consent">
               {props => <ConsentScreen {...props} session={session} />}
             </Tab.Screen>
             <Tab.Screen name="Auto-Trade">
-              {props => <SettingsScreen {...props} session={session} />}
+              {props => <SettingsScreen {...props} session={session} onPurge={() => setPurgeTrigger(prev => prev + 1)} />}
             </Tab.Screen>
           </Tab.Navigator>
         )}

@@ -1,0 +1,20 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite database
+*.db
+backend/*.db
+
+# Mobile app generated files
+node_modules/
+.expo/
+dist/
+android/
+ios/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -14,7 +14,7 @@
     "@react-navigation/native": "^6.1.6",
     "@react-navigation/native-stack": "^6.9.12",
     "@supabase/supabase-js": "2.105.4",
-    "expo": "~54.0.34",
+    "expo": "~54.0.35",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
     "react-dom": "19.1.0",

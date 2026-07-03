@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from backend.database import init_db, get_db, Signal, Position, DailyConsent, User
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
+from backend.signal_rules import resolve_trade_type, resolve_webhook_execution_mode
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 # Initialize FastAPI App
@@ -764,27 +765,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         timeframe_str = "5m"
         
     # Resolve Trade Type (INTRADAY or POSITIONAL)
-    raw_trade_type = payload.get("trade_type") or payload.get("type") or payload.get("style")
-    if raw_trade_type:
-        trade_type_str = str(raw_trade_type).strip().upper()
-        if trade_type_str in ["INTRADAY", "POSITIONAL"]:
-            trade_type_val = trade_type_str
-        else:
-            trade_type_val = "POSITIONAL" if "POSITIONAL" in trade_type_str else "INTRADAY"
-    else:
-        # Infer from source_name / orderId / signal_type first, then fallback to timeframe
-        hint_fields = " ".join([
-            str(payload.get("orderId") or ""),
-            str(payload.get("signal_type") or ""),
-            str(payload.get("source") or "")
-        ]).upper()
-        t_lower = timeframe_str.lower()
-        if "POSITIONAL" in hint_fields or any(x in t_lower for x in ["1d", "daily", "1w", "weekly", "positional"]):
-            trade_type_val = "POSITIONAL"
-        elif "INTRADAY" in hint_fields or any(x in t_lower for x in ["1m", "3m", "5m", "15m", "30m", "1h"]):
-            trade_type_val = "INTRADAY"
-        else:
-            trade_type_val = "INTRADAY"
+    trade_type_val = resolve_trade_type(payload, timeframe_str)
     
     # 3. Resolve Price
     price = payload.get("price") or payload.get("signal_price")
@@ -1040,7 +1021,10 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     for user in users:
         mgr = AppCredentialsManager(db, user_id=user.id)
         active_broker = mgr.get_active_broker()
-        mode_val = "LIVE" if active_broker else "PAPER"
+        mode_val = resolve_webhook_execution_mode(
+            os.environ.get("WEBHOOK_AUTO_EXECUTION_MODE", "PAPER"),
+            active_broker
+        )
         
         # Daily consent is only required for LIVE mode users
         if mode_val == "LIVE":
@@ -2073,4 +2057,3 @@ from fastapi.staticfiles import StaticFiles
 simulator_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "simulator")
 if os.path.exists(simulator_dir):
     app.mount("/", StaticFiles(directory=simulator_dir, html=True), name="static")
-
