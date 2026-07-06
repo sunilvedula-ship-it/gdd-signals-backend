@@ -19,6 +19,15 @@ const formatSignalDate = (isoString) => {
   return `${day}-${month}-${year} ${hoursStr}:${minutes} ${ampm}`;
 };
 
+const isPastIntradayCutoff = (signal) => {
+  if ((signal.trade_type || 'INTRADAY').toUpperCase() !== 'INTRADAY' || !signal.timestamp) return false;
+  const signalTime = new Date(signal.timestamp);
+  if (isNaN(signalTime.getTime())) return false;
+  const cutoff = new Date(signalTime);
+  cutoff.setHours(15, 15, 0, 0);
+  return new Date() >= cutoff;
+};
+
 export default function FeedScreen({ session, purgeTrigger }) {
   const { width, height } = useWindowDimensions();
   const useTwoColumns = width >= 900 && width > height;
@@ -324,7 +333,8 @@ export default function FeedScreen({ session, purgeTrigger }) {
       exitActions.includes(s.action) && 
       s.id > item.id
     );
-    const isActiveSignal = !exitExists && (isLong || isShort);
+    const cutoffReached = isPastIntradayCutoff(item);
+    const isActiveSignal = !exitExists && !cutoffReached && (isLong || isShort);
 
     const baseSymbol = getNormalizedBaseSymbol(item.symbol);
     const isMuted = mutedSymbols.includes(baseSymbol);
@@ -472,7 +482,9 @@ export default function FeedScreen({ session, purgeTrigger }) {
           </View>
         ) : (isLong || isShort) ? (
           <View style={styles.execPanelLocked}>
-            <Text style={styles.lockedTextExpired}>Signal inactive (trend exited)</Text>
+            <Text style={styles.lockedTextExpired}>
+              {cutoffReached ? 'Intraday closed at 3:15 PM' : 'Signal inactive (trend exited)'}
+            </Text>
           </View>
         ) : (
           <View style={styles.execPanelLocked}>

@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,13 +12,14 @@ os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DATABASE_PATH.as_posix()}"
 os.environ["VALID_SECRETS"] = "integration-test-secret"
 os.environ["ALLOW_SANDBOX_AUTH"] = "true"
 os.environ["LIVE_TRADING_ENABLED"] = "false"
+os.environ["ENABLE_INTRADAY_SQUARE_OFF_WORKER"] = "false"
 os.environ.pop("WEBHOOK_AUTO_EXECUTION_MODE", None)
 
 from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
 from backend.database import BrokerOrder, Position, SessionLocal, Signal, engine, init_db
-from backend.main import app
+from backend.main import app, square_off_expired_intraday_positions
 
 
 class BankNiftyWebhookIntegrationTests(unittest.TestCase):
@@ -110,7 +112,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 source_name="manual-paper-test",
                 raw_payload="{}",
                 timeframe="5m",
-                trade_type="INTRADAY",
+                trade_type="POSITIONAL",
             )
             db.add(signal)
             db.commit()
@@ -137,7 +139,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 source_name="live-lock-test",
                 raw_payload="{}",
                 timeframe="5m",
-                trade_type="INTRADAY",
+                trade_type="POSITIONAL",
             )
             db.add(signal)
             db.commit()
@@ -162,7 +164,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 source_name="aliceblue-live-test",
                 raw_payload="{}",
                 timeframe="5m",
-                trade_type="INTRADAY",
+                trade_type="POSITIONAL",
             )
             db.add(signal)
             db.commit()
@@ -244,6 +246,189 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
             self.assertEqual(position.entry_broker_order_id, "260706000000001")
             self.assertEqual(order.status, "SUBMITTED")
             self.assertEqual(order.position_id, position.id)
+        finally:
+            db.close()
+
+    def test_target_hit_closes_matching_position(self):
+        entry_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "WIPRO",
+                "price": 500,
+                "orderId": "positional_target_test",
+                "action": "long",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(entry_response.status_code, 200, entry_response.text)
+
+        exit_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "WIPRO",
+                "price": 510,
+                "orderId": "positional_target_test",
+                "action": "Target Hit",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(exit_response.status_code, 200, exit_response.text)
+
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(Position.symbol == "WIPRO").order_by(Position.id.desc()).first()
+            signal = db.query(Signal).filter(Signal.symbol == "WIPRO").order_by(Signal.id.desc()).first()
+            self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.exit_reason, "TARGET_HIT")
+            self.assertEqual(signal.action, "EXIT")
+        finally:
+            db.close()
+
+    def test_sell_exit_does_not_reopen_a_short_position(self):
+        entry_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "INFY",
+                "price": 1500,
+                "orderId": "positional_sell_exit_test",
+                "action": "long",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(entry_response.status_code, 200, entry_response.text)
+
+        exit_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "INFY",
+                "price": 1510,
+                "orderId": "positional_sell_exit_test",
+                "action": "sell",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(exit_response.status_code, 200, exit_response.text)
+
+        db = SessionLocal()
+        try:
+            positions = db.query(Position).filter(Position.symbol == "INFY").all()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0].status, "CLOSED")
+            self.assertEqual(positions[0].exit_reason, "SIGNAL_EXIT")
+        finally:
+            db.close()
+
+    def test_exit_short_closes_bought_put_option(self):
+        entry_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "SENSEX",
+                "price": 80000,
+                "orderId": "positional_short_exit_test",
+                "action": "short",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(entry_response.status_code, 200, entry_response.text)
+
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(
+                Position.symbol.like("SENSEX %"),
+                Position.trade_type == "POSITIONAL",
+            ).order_by(Position.id.desc()).first()
+            self.assertTrue(position.symbol.endswith(" PE"))
+            position_id = position.id
+        finally:
+            db.close()
+
+        exit_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "SENSEX",
+                "price": 79900,
+                "orderId": "positional_short_exit_test",
+                "action": "exit_short",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(exit_response.status_code, 200, exit_response.text)
+
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(Position.id == position_id).one()
+            self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.exit_reason, "SIGNAL_EXIT")
+        finally:
+            db.close()
+
+    def test_intraday_positions_close_at_cutoff_but_positional_remains_open(self):
+        db = SessionLocal()
+        try:
+            signal = Signal(
+                symbol="CUTTEST",
+                action="LONG",
+                price=100,
+                source="test",
+                source_name="intraday_cutoff_test",
+                raw_payload="{}",
+                timestamp=datetime(2026, 7, 6, 14, 0),
+                timeframe="5m",
+                trade_type="INTRADAY",
+            )
+            db.add(signal)
+            db.flush()
+            intraday = Position(
+                user_id=1,
+                symbol="CUTTEST",
+                direction="LONG",
+                qty=1,
+                entry_price=100,
+                entry_time=datetime(2026, 7, 6, 14, 0),
+                status="OPEN",
+                real_or_paper="PAPER",
+                signal_id=signal.id,
+                timeframe="5m",
+                trade_type="INTRADAY",
+            )
+            positional = Position(
+                user_id=1,
+                symbol="CUTTEST-POS",
+                direction="LONG",
+                qty=1,
+                entry_price=100,
+                entry_time=datetime(2026, 7, 6, 14, 0),
+                status="OPEN",
+                real_or_paper="PAPER",
+                timeframe="5m",
+                trade_type="POSITIONAL",
+            )
+            db.add_all([intraday, positional])
+            db.commit()
+
+            with patch("backend.main.get_live_market_price", return_value=105):
+                result = square_off_expired_intraday_positions(
+                    db,
+                    now=datetime(2026, 7, 6, 15, 15),
+                )
+
+            db.refresh(intraday)
+            db.refresh(positional)
+            self.assertIn(intraday.id, result["closed_position_ids"])
+            self.assertEqual(intraday.status, "CLOSED")
+            self.assertEqual(intraday.exit_reason, "INTRADAY_CUTOFF")
+            self.assertEqual(positional.status, "OPEN")
+            cutoff_signal = db.query(Signal).filter(
+                Signal.symbol == "CUTTEST",
+                Signal.source_name == "SYSTEM_INTRADAY_CUTOFF",
+            ).first()
+            self.assertIsNotNone(cutoff_signal)
         finally:
             db.close()
 

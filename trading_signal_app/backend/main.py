@@ -3,6 +3,7 @@ import json
 import math
 import html
 import secrets
+import asyncio
 from urllib.parse import quote
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 
-from backend.database import init_db, get_db, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState
+from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
 from backend.aliceblue_client import (
@@ -65,6 +66,8 @@ class ConnectionManager:
                 pass
 
 manager = ConnectionManager()
+
+INTRADAY_SQUARE_OFF_TIME = time(15, 15)
 
 # Webhook payload model
 class WebhookPayload(BaseModel):
@@ -569,8 +572,10 @@ def extract_strike_from_symbol(symbol: str) -> Optional[float]:
         return float(parse_res["strike"])
     return None
 
-def close_position_entry(pos: Position, index_exit_price: float, db: Session) -> float:
+def close_position_entry(pos: Position, index_exit_price: float, db: Session, reason: Optional[str] = None) -> float:
     parse_res = parse_option_symbol(pos.symbol)
+    if reason:
+        pos.exit_reason = reason
     
     if parse_res.get("is_option"):
         underlying = parse_res["underlying"]
@@ -729,12 +734,156 @@ def safe_open_position_entry(symbol: str, direction: str, entry_price: float, qt
     except Exception as ex:
         trade_log.append(f"User {user_id}: Failed to open {direction} position for {symbol} in {real_or_paper} mode: {ex}")
 
-def safe_close_position_entry(pos: Position, index_exit_price: float, db: Session, trade_log: list, success_msg_template: str):
+def safe_close_position_entry(
+    pos: Position,
+    index_exit_price: float,
+    db: Session,
+    trade_log: list,
+    success_msg_template: str,
+    reason: Optional[str] = None,
+):
     try:
-        pnl = close_position_entry(pos, index_exit_price, db)
+        pnl = close_position_entry(pos, index_exit_price, db, reason=reason)
         trade_log.append(success_msg_template.format(pnl=pnl, exit_price=pos.exit_price))
     except Exception as ex:
         trade_log.append(f"User {pos.user_id}: Failed to close {pos.direction} position on {pos.symbol} in {pos.real_or_paper} mode: {ex}")
+
+
+def is_intraday_entry_closed(signal: Signal, now: Optional[datetime] = None) -> bool:
+    if str(signal.trade_type or "INTRADAY").upper() != "INTRADAY":
+        return False
+    current = now or get_ist_time()
+    signal_date = signal.timestamp.date() if signal.timestamp else current.date()
+    return signal_date < current.date() or (
+        signal_date == current.date() and current.time() >= INTRADAY_SQUARE_OFF_TIME
+    )
+
+
+def get_position_underlying(pos: Position) -> str:
+    parsed = parse_option_symbol(pos.symbol)
+    if parsed.get("is_option"):
+        return parsed["underlying"]
+    return normalize_symbol(pos.symbol)
+
+
+def ensure_cutoff_exit_signal(pos: Position, db: Session, now: datetime) -> None:
+    entry_signal = db.query(Signal).filter(Signal.id == pos.signal_id).first() if pos.signal_id else None
+    signal_symbol = entry_signal.symbol if entry_signal else get_position_underlying(pos)
+    day_start = datetime.combine(now.date(), time.min)
+    existing = db.query(Signal).filter(
+        Signal.symbol == signal_symbol,
+        Signal.action == "EXIT",
+        Signal.source_name == "SYSTEM_INTRADAY_CUTOFF",
+        Signal.timestamp >= day_start,
+    ).first()
+    if existing:
+        return
+
+    db.add(Signal(
+        symbol=signal_symbol,
+        action="EXIT",
+        price=pos.exit_price or pos.entry_price,
+        source="SYSTEM",
+        source_name="SYSTEM_INTRADAY_CUTOFF",
+        raw_payload=json.dumps({"reason": "INTRADAY_CUTOFF", "position_id": pos.id}),
+        timestamp=now,
+        timeframe=pos.timeframe or "5m",
+        trade_type="INTRADAY",
+    ))
+
+
+def square_off_expired_intraday_positions(db: Session, now: Optional[datetime] = None) -> dict:
+    current = now or get_ist_time()
+    candidates = db.query(Position).filter(
+        Position.status.in_(["OPEN", "PARTIAL"]),
+    ).all()
+    positions = [
+        pos for pos in candidates
+        if str(pos.trade_type or "INTRADAY").upper() == "INTRADAY"
+        and pos.entry_time
+        and (
+            pos.entry_time.date() < current.date()
+            or (pos.entry_time.date() == current.date() and current.time() >= INTRADAY_SQUARE_OFF_TIME)
+        )
+    ]
+
+    closed_ids = []
+    pending_ids = []
+    errors = []
+    for pos in positions:
+        if str(pos.real_or_paper or "PAPER").upper() == "LIVE" and not env_flag("LIVE_TRADING_ENABLED"):
+            errors.append({"position_id": pos.id, "error": "Live trading is disabled"})
+            continue
+
+        underlying = get_position_underlying(pos)
+        exit_price = get_live_market_price(underlying)
+        if exit_price is None:
+            latest_signal = db.query(Signal).filter(
+                Signal.symbol == underlying,
+            ).order_by(Signal.timestamp.desc()).first()
+            exit_price = latest_signal.price if latest_signal else pos.entry_price
+
+        try:
+            close_position_entry(pos, float(exit_price), db, reason="INTRADAY_CUTOFF")
+            ensure_cutoff_exit_signal(pos, db, current)
+            if pos.status == "CLOSED":
+                closed_ids.append(pos.id)
+            else:
+                pending_ids.append(pos.id)
+        except Exception as exc:
+            errors.append({"position_id": pos.id, "error": str(exc)})
+
+    if closed_ids or pending_ids:
+        db.commit()
+    return {"closed_position_ids": closed_ids, "pending_position_ids": pending_ids, "errors": errors}
+
+
+async def intraday_square_off_worker() -> None:
+    last_run_date = None
+    first_pass = True
+    while True:
+        current = get_ist_time()
+        cutoff_due = current.time() >= INTRADAY_SQUARE_OFF_TIME and last_run_date != current.date()
+        if first_pass or cutoff_due:
+            db = SessionLocal()
+            try:
+                square_off_expired_intraday_positions(db, now=current)
+                if cutoff_due:
+                    last_run_date = current.date()
+                first_pass = False
+            except Exception as exc:
+                db.rollback()
+                print(f"[Intraday Square-Off] Worker error: {exc}")
+            finally:
+                db.close()
+        await asyncio.sleep(20)
+
+
+@app.on_event("startup")
+async def start_intraday_square_off_worker():
+    app.state.intraday_square_off_task = None
+    if env_flag("ENABLE_INTRADAY_SQUARE_OFF_WORKER", True):
+        app.state.intraday_square_off_task = asyncio.create_task(intraday_square_off_worker())
+
+
+@app.on_event("shutdown")
+async def stop_intraday_square_off_worker():
+    task = getattr(app.state, "intraday_square_off_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@app.post("/api/system/intraday-square-off")
+def trigger_intraday_square_off(request: Request, db: Session = Depends(get_db)):
+    expected = os.environ.get("SQUARE_OFF_SECRET", "").strip()
+    supplied = request.headers.get("x-square-off-secret", "")
+    if not expected or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized square-off request")
+    return square_off_expired_intraday_positions(db)
 
 # Helper to determine qty and lot size based on symbol rules
 def calculate_trade_qty(symbol: str) -> float:
@@ -878,7 +1027,6 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
     if price_val is None and not is_json and body_str:
         # Search for a decimal/float number in the plain text body
-        import re
         numbers = re.findall(r"\b\d+(?:\.\d+)?\b", body_str)
         if numbers:
             try:
@@ -898,10 +1046,25 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     raw_action = payload.get("action")
     raw_key = payload.get("key")
     raw_dir = payload.get("direction")
+    action_context = " ".join(
+        str(value or "")
+        for value in (
+            raw_action,
+            raw_key,
+            raw_dir,
+            payload.get("text"),
+            payload.get("message"),
+            payload.get("alert"),
+            body_str,
+        )
+    ).upper()
+    is_target_hit = bool(re.search(r"\bTARGET[\s_-]*HIT\b", action_context))
     
     action_norm = "EXIT" # Default fallback
     
-    if raw_action:
+    if is_target_hit:
+        action_norm = "EXIT"
+    elif raw_action:
         act_lower = str(raw_action).lower()
         if act_lower in ["exit_long", "exitlong"]:
             action_norm = "EXIT_LONG"
@@ -947,8 +1110,6 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 
         if search_text:
             text_upper = search_text.upper()
-            import re
-            
             # 1. Precise Word Boundary Checks
             if re.search(r"\bEXIT_LONG\b", text_upper) or re.search(r"\bSELLALERT\b", text_upper) or re.search(r"\bSELL_ALERT\b", text_upper) or re.search(r"\bEXIT\s+LONG\b", text_upper) or re.search(r"\bSELL\s+ALERT\b", text_upper):
                 action_norm = "EXIT_LONG"
@@ -1103,6 +1264,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     db.commit()
     
     trade_log = []
+    intraday_cutoff_reached = is_intraday_entry_closed(signal_entry, ist_now)
     
     # 5. Process execution for all users
     today_str = ist_now.date().isoformat()
@@ -1133,7 +1295,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         if is_symbol_muted(symbol_norm, user.muted_symbols):
             print(f"[Webhook Skipped] Symbol {symbol_norm} is muted for User {user.id} ({user.name})")
             continue
-            
+
         # Check for open positions on this symbol or its options for this user
         # Scoped to same trade_type so INTRADAY and POSITIONAL coexist independently
         user_open_positions = db.query(Position).filter(
@@ -1142,19 +1304,25 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
              (Position.symbol == underlying_norm) |
              (Position.symbol.like(f"{symbol_norm} %")) |
              (Position.symbol.like(f"{underlying_norm} %"))),
-            Position.status == "OPEN",
+            Position.status.in_(["OPEN", "PARTIAL"]),
             Position.trade_type == trade_type_val
         ).all()
+
+        cutoff_blocks_entry = intraday_cutoff_reached and (
+            action_norm in {"LONG", "SHORT", "BUY"}
+            or (action_norm == "SELL" and not user_open_positions)
+        )
+        if cutoff_blocks_entry:
+            trade_log.append(f"User {user.id}: Intraday entry ignored after 3:15 PM IST")
+            processed_users_count += 1
+            continue
         
         open_pos_future = next((p for p in user_open_positions if p.symbol == symbol_norm), None)
         
         user_action = action_norm
-        # Contextual Exit Action Labels (SELL & COVER instead of EXIT)
-        if user_action == "EXIT" and open_pos_future:
-            if open_pos_future.direction == "LONG":
-                user_action = "SELL"
-            else:
-                user_action = "COVER"
+        # A SELL against an existing long/option position is an exit, never a new short entry.
+        if user_action == "SELL" and any(p.direction == "LONG" for p in user_open_positions):
+            user_action = "EXIT"
                 
         # Execution Logic for this user
         if user_action in ["BUY", "LONG"]:
@@ -1232,15 +1400,24 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 for p in user_open_positions:
                     # Direction-aware exit check to prevent exit-ordering race conditions
                     should_close = False
+                    parsed_position = parse_option_symbol(p.symbol)
+                    option_type = parsed_position.get("opt_type") if parsed_position.get("is_option") else None
                     if user_action in ["EXIT", "CLOSE"]:
                         should_close = True
-                    elif user_action == "EXIT_LONG" and p.direction == "LONG":
+                    elif user_action == "EXIT_LONG" and p.direction == "LONG" and option_type != "PE":
                         should_close = True
-                    elif user_action in ["EXIT_SHORT", "COVER"] and p.direction == "SHORT":
+                    elif user_action in ["EXIT_SHORT", "COVER"] and (p.direction == "SHORT" or option_type == "PE"):
                         should_close = True
                         
                     if should_close:
-                        safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})")
+                        safe_close_position_entry(
+                            p,
+                            price_val,
+                            db,
+                            trade_log,
+                            "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})",
+                            reason="TARGET_HIT" if is_target_hit else "SIGNAL_EXIT",
+                        )
             else:
                 trade_log.append(f"User {user.id}: Received exit signal for {symbol_norm} but no open position existed")
         processed_users_count += 1
@@ -1271,6 +1448,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/api/signals")
 def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    square_off_expired_intraday_positions(db)
     signals = db.query(Signal).order_by(Signal.timestamp.desc()).limit(limit).all()
     filtered_signals = [s for s in signals if not is_symbol_muted(s.symbol, user.muted_symbols)]
     return [{
@@ -1617,6 +1795,7 @@ def reconcile_pending_aliceblue_positions(user_id: int, db: Session) -> None:
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     reconcile_pending_aliceblue_positions(user.id, db)
+    square_off_expired_intraday_positions(db)
     positions = db.query(Position).filter(Position.user_id == user.id).order_by(Position.entry_time.desc()).all()
     
     # Calculate stats
@@ -1654,6 +1833,7 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "entry_time": p.entry_time.isoformat(),
                 "exit_price": None,
                 "exit_time": None,
+                "exit_reason": p.exit_reason,
                 "status": p.status,
                 "current_price": current_price,
                 "pnl": round(pnl, 2),
@@ -1681,6 +1861,7 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "entry_time": p.entry_time.isoformat(),
                 "exit_price": p.exit_price,
                 "exit_time": p.exit_time.isoformat() if p.exit_time else None,
+                "exit_reason": p.exit_reason,
                 "status": p.status,
                 "pnl": p.pnl,
                 "real_or_paper": p.real_or_paper,
@@ -1724,7 +1905,7 @@ def manual_exit_position(pos_id: int, db: Session = Depends(get_db), user: User 
         latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
         index_exit_price = latest_signal.price if latest_signal else pos.entry_price
         
-    close_position_entry(pos, index_exit_price, db)
+    close_position_entry(pos, index_exit_price, db, reason="MANUAL_EXIT")
     db.commit()
     return {"status": "success", "pnl": pos.pnl}
 
@@ -2245,6 +2426,8 @@ def preview_broker_order(
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
+    if is_intraday_entry_closed(signal):
+        raise HTTPException(status_code=400, detail="Intraday entries close at 3:15 PM IST")
     if signal.action.upper() not in {"LONG", "SHORT", "BUY"}:
         raise HTTPException(status_code=400, detail="Only active entry signals can be traded")
 
@@ -2298,6 +2481,8 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
+    if is_intraday_entry_closed(signal):
+        raise HTTPException(status_code=400, detail="Intraday entries close at 3:15 PM IST")
         
     # Block manual entry executions on exit signals (Sell, Cover, Exit)
     if signal.action.upper() in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL"]:
@@ -2509,7 +2694,7 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
         index_exit_price = latest_signal.price if latest_signal else pos.entry_price
         
     try:
-        close_position_entry(pos, index_exit_price, db)
+        close_position_entry(pos, index_exit_price, db, reason="MANUAL_EXIT")
         db.commit()
     except Exception as ex:
         raise HTTPException(status_code=400, detail=f"Broker Exit Failed: {str(ex)}")

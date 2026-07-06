@@ -124,6 +124,7 @@ const getGroupedHistory = (closedPos) => {
 export default function PaperTradeScreen({ session, purgeTrigger }) {
   const { width, height } = useWindowDimensions();
   const isCompactLandscape = width > height && width < 900;
+  const isNarrow = width < 430;
   const [positions, setPositions] = useState([]);
   const [stats, setStats] = useState({ total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
   const [mutedSymbols, setMutedSymbols] = useState([]);
@@ -344,43 +345,26 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
 
     const baseSymbol = getNormalizedBaseSymbol(item.symbol);
     const isMuted = mutedSymbols.includes(baseSymbol);
+    const exitReasonLabels = {
+      INTRADAY_CUTOFF: '3:15 PM intraday close',
+      TARGET_HIT: 'Target hit',
+      SIGNAL_EXIT: 'Exit signal',
+      MANUAL_EXIT: 'Manual exit',
+    };
+    const exitReason = exitReasonLabels[item.exit_reason] || item.exit_reason;
 
     return (
       <View key={item.id} style={[styles.card, isMuted && { opacity: 0.6 }]}>
         <View style={styles.cardHeader}>
-          <View style={styles.leftHeader}>
+          <View style={styles.positionTitleRow}>
             <View style={[styles.dirBadge, isLong ? styles.dirLong : styles.dirShort]}>
               <Text style={styles.dirText}>{displayDirection}</Text>
             </View>
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <Text style={styles.symbol}>{item.symbol}</Text>
-              {item.timeframe && (
-                <View style={[styles.timeframeBadge, { marginRight: 6 }]}>
-                  <Text style={styles.timeframeBadgeText}>⏱ {item.timeframe}</Text>
-                </View>
-              )}
-              {item.trade_type && (
-                <View style={[
-                  styles.timeframeBadge, 
-                  { 
-                    backgroundColor: item.trade_type === 'POSITIONAL' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(16, 185, 129, 0.12)', 
-                    borderColor: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981', 
-                    borderWidth: 1, 
-                    marginRight: 6 
-                  }
-                ]}>
-                  <Text style={[styles.timeframeBadgeText, { color: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981' }]}>
-                    {item.trade_type}
-                  </Text>
-                </View>
-              )}
-              <TouchableOpacity onPress={() => handleToggleMute(item.symbol)} style={{ paddingHorizontal: 4 }}>
-                <Text style={{ fontSize: 12 }}>{isMuted ? '🔕' : '🔔'}</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={styles.qty}>{qtyDisplay}</Text>
+            <Text style={styles.symbol} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.72}>
+              {item.symbol}
+            </Text>
           </View>
-          <Text style={[styles.pnl, pnlTextColor]}>
+          <Text style={[styles.pnl, pnlTextColor]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.72}>
             {isClosed 
               ? `${currencySymbol}${item.pnl.toLocaleString(locale, {minimumFractionDigits: 2})}` 
               : isEntryPending
@@ -395,25 +379,55 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
             }
           </Text>
         </View>
+
+        <View style={styles.positionMetaRow}>
+          {item.timeframe && (
+            <View style={styles.timeframeBadge}>
+              <Text style={styles.timeframeBadgeText}>⏱ {item.timeframe}</Text>
+            </View>
+          )}
+          {item.trade_type && (
+            <View style={[
+              styles.timeframeBadge,
+              {
+                backgroundColor: item.trade_type === 'POSITIONAL' ? 'rgba(59, 130, 246, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+                borderColor: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981',
+                borderWidth: 1,
+              }
+            ]}>
+              <Text style={[styles.timeframeBadgeText, { color: item.trade_type === 'POSITIONAL' ? '#3b82f6' : '#10b981' }]}>
+                {item.trade_type}
+              </Text>
+            </View>
+          )}
+          <TouchableOpacity onPress={() => handleToggleMute(item.symbol)} style={styles.muteButton}>
+            <Text style={{ fontSize: 12 }}>{isMuted ? '🔕' : '🔔'}</Text>
+          </TouchableOpacity>
+          <Text style={styles.qty} numberOfLines={1}>{qtyDisplay}</Text>
+        </View>
         
-        <View style={styles.cardDetails}>
-          <Text style={styles.detailText}>
-            Entry: {currencySymbol}{item.entry_price.toLocaleString(locale, {minimumFractionDigits: 2})}
-            {item.entry_time && ` (${formatSignalDate(item.entry_time)})`}
-            {!isClosed && item.current_price && ` | LTP: ${currencySymbol}${item.current_price.toLocaleString(locale, {minimumFractionDigits: 2})}`}
-          </Text>
-          {isClosed ? (
+        <View style={[styles.cardDetails, isNarrow && styles.cardDetailsNarrow]}>
+          <View style={styles.detailBlock}>
             <Text style={styles.detailText}>
-              Exit: {currencySymbol}{item.exit_price.toLocaleString(locale, {minimumFractionDigits: 2})}
-              {item.exit_time && ` (${formatSignalDate(item.exit_time)})`}
+              Entry: {currencySymbol}{item.entry_price.toLocaleString(locale, {minimumFractionDigits: 2})}
+              {item.entry_time && ` (${formatSignalDate(item.entry_time)})`}
+              {!isClosed && item.current_price && ` | LTP: ${currencySymbol}${item.current_price.toLocaleString(locale, {minimumFractionDigits: 2})}`}
             </Text>
-          ) : item.status === 'OPEN' ? (
-            <TouchableOpacity style={styles.exitBtn} onPress={() => closePosition(item.id)}>
+            {isClosed && (
+              <Text style={styles.detailText}>
+                Exit: {currencySymbol}{item.exit_price.toLocaleString(locale, {minimumFractionDigits: 2})}
+                {item.exit_time && ` (${formatSignalDate(item.exit_time)})`}
+              </Text>
+            )}
+            {isClosed && exitReason && <Text style={styles.exitReason}>Closed: {exitReason}</Text>}
+          </View>
+          {!isClosed && item.status === 'OPEN' ? (
+            <TouchableOpacity style={[styles.exitBtn, isNarrow && styles.exitBtnNarrow]} onPress={() => closePosition(item.id)}>
               <Text style={styles.exitBtnText}>MANUAL EXIT</Text>
             </TouchableOpacity>
-          ) : (
+          ) : !isClosed ? (
             <Text style={styles.detailText}>{item.order_status || 'AWAITING BROKER UPDATE'}</Text>
-          )}
+          ) : null}
         </View>
       </View>
     );
@@ -667,23 +681,23 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
       <View style={[styles.statsContainer, isCompactLandscape && styles.statsContainerCompact]}>
         <View style={styles.statBox}>
           <Text style={styles.statLabel}>INR P&L</Text>
-          <Text style={[styles.statValue, inrPnlStyle]}>
-            ₹{inrPnl.toLocaleString('en-IN', {minimumFractionDigits: 2})}
+          <Text style={[styles.statValue, inrPnlStyle]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>
+            ₹{inrPnl.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}
           </Text>
         </View>
         <View style={styles.statBox}>
           <Text style={styles.statLabel}>USD P&L</Text>
-          <Text style={[styles.statValue, usdPnlStyle]}>
-            ${usdPnl.toLocaleString('en-US', {minimumFractionDigits: 2})}
+          <Text style={[styles.statValue, usdPnlStyle]} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>
+            ${usdPnl.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}
           </Text>
         </View>
         <View style={styles.statBox}>
           <Text style={styles.statLabel}>WIN RATE</Text>
-          <Text style={styles.statValue}>{(stats.win_rate || 0).toFixed(1)}%</Text>
+          <Text style={styles.statValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{(stats.win_rate || 0).toFixed(1)}%</Text>
         </View>
         <View style={styles.statBox}>
           <Text style={styles.statLabel}>TRADES</Text>
-          <Text style={styles.statValue}>{stats.total_trades}</Text>
+          <Text style={styles.statValue} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.65}>{stats.total_trades}</Text>
         </View>
       </View>
 
@@ -828,6 +842,8 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: 'bold',
     color: '#ffffff',
+    width: '100%',
+    textAlign: 'center',
   },
   title: {
     fontSize: 15,
@@ -929,9 +945,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 6,
   },
-  leftHeader: {
+  positionTitleRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    flex: 1,
+    minWidth: 0,
   },
   dirBadge: {
     paddingHorizontal: 6,
@@ -954,16 +972,30 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: 'bold',
     color: '#ffffff',
-    marginRight: 6,
+    flex: 1,
+    minWidth: 0,
+  },
+  positionMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  muteButton: {
+    paddingHorizontal: 4,
+    marginRight: 2,
   },
   qty: {
     fontSize: 10,
     color: '#9ca3af',
-    marginLeft: 6,
+    marginLeft: 'auto',
   },
   pnl: {
     fontSize: 13,
     fontWeight: 'bold',
+    maxWidth: '42%',
+    marginLeft: 8,
+    textAlign: 'right',
   },
   textProfit: { color: '#10b981' },
   textLoss: { color: '#ef4444' },
@@ -977,9 +1009,25 @@ const styles = StyleSheet.create({
     paddingTop: 6,
     marginTop: 2,
   },
+  cardDetailsNarrow: {
+    flexDirection: 'column',
+    alignItems: 'stretch',
+  },
+  detailBlock: {
+    flex: 1,
+    minWidth: 0,
+  },
   detailText: {
     fontSize: 10,
     color: '#9ca3af',
+    lineHeight: 15,
+    flexShrink: 1,
+  },
+  exitReason: {
+    color: '#60a5fa',
+    fontSize: 9,
+    fontWeight: 'bold',
+    marginTop: 3,
   },
   exitBtn: {
     backgroundColor: 'rgba(239, 68, 68, 0.12)',
@@ -988,6 +1036,13 @@ const styles = StyleSheet.create({
     borderRadius: 4,
     paddingHorizontal: 6,
     paddingVertical: 2,
+    marginLeft: 8,
+    flexShrink: 0,
+  },
+  exitBtnNarrow: {
+    alignSelf: 'flex-end',
+    marginLeft: 0,
+    marginTop: 8,
   },
   exitBtnText: {
     color: '#ef4444',

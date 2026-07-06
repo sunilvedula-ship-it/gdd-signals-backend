@@ -74,6 +74,7 @@ class Position(Base):
     entry_time = Column(DateTime, default=datetime.utcnow)
     exit_price = Column(Float, nullable=True)
     exit_time = Column(DateTime, nullable=True)
+    exit_reason = Column(String, nullable=True)
     status = Column(String, default="OPEN")  # OPEN, CLOSED
     pnl = Column(Float, default=0.0)
     real_or_paper = Column(String, default="PAPER")  # PAPER, LIVE
@@ -285,6 +286,7 @@ def init_db():
             "exit_broker_order_id": "VARCHAR(100)",
             "exit_order_status": "VARCHAR(50)",
             "exit_filled_qty": "INTEGER DEFAULT 0",
+            "exit_reason": "VARCHAR(50)",
         }
         for column_name, column_type in position_broker_columns.items():
             try:
