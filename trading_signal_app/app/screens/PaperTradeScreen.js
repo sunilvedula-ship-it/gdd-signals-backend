@@ -152,7 +152,7 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
 
     // 3. Tab Filter (Active vs History)
     if (activeTab === 'active') {
-      if (pos.status === 'OPEN') return true;
+      if (['OPEN', 'PENDING', 'PARTIAL', 'EXIT_PENDING', 'EXIT_PARTIAL'].includes(pos.status)) return true;
       if (pos.status === 'CLOSED' && pos.exit_time) {
         const exitDate = new Date(pos.exit_time);
         const now = new Date();
@@ -162,7 +162,7 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
       }
       return false;
     } else {
-      return pos.status === 'CLOSED';
+      return ['CLOSED', 'REJECTED'].includes(pos.status);
     }
   });
 
@@ -312,6 +312,10 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
 
   const renderPositionCard = (item) => {
     const isClosed = item.status === 'CLOSED';
+    const isEntryPending = item.status === 'PENDING';
+    const isEntryPartial = item.status === 'PARTIAL';
+    const isExitPending = item.status === 'EXIT_PENDING';
+    const isExitPartial = item.status === 'EXIT_PARTIAL';
     const isItemProfit = item.pnl > 0;
     const isItemLoss = item.pnl < 0;
     const pnlTextColor = isItemProfit ? styles.textProfit : (isItemLoss ? styles.textLoss : styles.textNeutral);
@@ -377,7 +381,15 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
           <Text style={[styles.pnl, pnlTextColor]}>
             {isClosed 
               ? `${currencySymbol}${item.pnl.toLocaleString(locale, {minimumFractionDigits: 2})}` 
-              : `${currencySymbol}${item.pnl.toLocaleString(locale, {minimumFractionDigits: 2})} (OPEN)`
+              : isEntryPending
+                ? 'ENTRY PENDING'
+                : isEntryPartial
+                  ? 'PARTIAL FILL'
+                : isExitPending
+                  ? 'EXIT PENDING'
+                  : isExitPartial
+                    ? 'PARTIAL EXIT'
+                  : `${currencySymbol}${item.pnl.toLocaleString(locale, {minimumFractionDigits: 2})} (OPEN)`
             }
           </Text>
         </View>
@@ -393,10 +405,12 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
               Exit: {currencySymbol}{item.exit_price.toLocaleString(locale, {minimumFractionDigits: 2})}
               {item.exit_time && ` (${formatSignalDate(item.exit_time)})`}
             </Text>
-          ) : (
+          ) : item.status === 'OPEN' ? (
             <TouchableOpacity style={styles.exitBtn} onPress={() => closePosition(item.id)}>
               <Text style={styles.exitBtnText}>MANUAL EXIT</Text>
             </TouchableOpacity>
+          ) : (
+            <Text style={styles.detailText}>{item.order_status || 'AWAITING BROKER UPDATE'}</Text>
           )}
         </View>
       </View>

@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Boolean, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 # Resolve database connection string from environment variables for production (e.g. Supabase, Render, Railway Postgres)
@@ -80,6 +80,15 @@ class Position(Base):
     signal_id = Column(Integer, ForeignKey('signals.id'), nullable=True)
     timeframe = Column(String, default="5m", nullable=True)
     trade_type = Column(String, default="INTRADAY", nullable=True) # INTRADAY, POSITIONAL
+    broker_id = Column(String, nullable=True)
+    broker_instrument_id = Column(String, nullable=True)
+    broker_trading_symbol = Column(String, nullable=True)
+    entry_broker_order_id = Column(String, nullable=True)
+    entry_order_status = Column(String, nullable=True)
+    entry_filled_qty = Column(Integer, default=0)
+    exit_broker_order_id = Column(String, nullable=True)
+    exit_order_status = Column(String, nullable=True)
+    exit_filled_qty = Column(Integer, default=0)
 
 class DailyConsent(Base):
     __tablename__ = 'daily_consents'
@@ -101,6 +110,44 @@ class BrokerCredential(Base):
     api_secret = Column(String)
     extra_fields = Column(String)  # JSON string for extra fields (client_id, consumer_key, etc.)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BrokerOrder(Base):
+    __tablename__ = 'broker_orders'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'idempotency_key', name='uq_broker_order_user_idempotency'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True, nullable=False)
+    signal_id = Column(Integer, ForeignKey('signals.id'), nullable=True)
+    position_id = Column(Integer, ForeignKey('positions.id'), nullable=True)
+    broker_id = Column(String, index=True, nullable=False)
+    idempotency_key = Column(String, nullable=False)
+    order_kind = Column(String, default='ENTRY')
+    symbol = Column(String, nullable=False)
+    broker_trading_symbol = Column(String, nullable=True)
+    broker_instrument_id = Column(String, nullable=True)
+    transaction_type = Column(String, nullable=False)
+    quantity = Column(Integer, nullable=False)
+    limit_price = Column(Float, nullable=False)
+    status = Column(String, default='PENDING', index=True)
+    broker_order_id = Column(String, nullable=True, index=True)
+    broker_response = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BrokerAuthState(Base):
+    __tablename__ = 'broker_auth_states'
+
+    id = Column(Integer, primary_key=True, index=True)
+    nonce = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True, nullable=False)
+    broker_id = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
@@ -226,6 +273,32 @@ def init_db():
             db.commit()
         except Exception:
             db.rollback()
+
+        # Broker execution audit fields for live positions.
+        position_broker_columns = {
+            "broker_id": "VARCHAR(50)",
+            "broker_instrument_id": "VARCHAR(100)",
+            "broker_trading_symbol": "VARCHAR(255)",
+            "entry_broker_order_id": "VARCHAR(100)",
+            "entry_order_status": "VARCHAR(50)",
+            "entry_filled_qty": "INTEGER DEFAULT 0",
+            "exit_broker_order_id": "VARCHAR(100)",
+            "exit_order_status": "VARCHAR(50)",
+            "exit_filled_qty": "INTEGER DEFAULT 0",
+        }
+        for column_name, column_type in position_broker_columns.items():
+            try:
+                if "postgresql" in DATABASE_URL:
+                    db.execute(text(
+                        f"ALTER TABLE positions ADD COLUMN IF NOT EXISTS {column_name} {column_type};"
+                    ))
+                else:
+                    db.execute(text(
+                        f"ALTER TABLE positions ADD COLUMN {column_name} {column_type};"
+                    ))
+                db.commit()
+            except Exception:
+                db.rollback()
 
         # Repair signals saved by the old parser, which treated type=long/short as INTRADAY.
         try:

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity } from 'react-native';
+import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity, Alert } from 'react-native';
 import { BACKEND_URL } from '../config';
 
 const formatSignalDate = (isoString) => {
@@ -129,7 +129,7 @@ export default function FeedScreen({ session, purgeTrigger }) {
     return sym.includes('BTC') || sym.includes('ETH') || sym.includes('SOL') || sym.includes('USD') || sym.includes('USDT');
   };
 
-  const handleExecuteOrder = async (signalId, symbol) => {
+  const submitOrder = async (signalId, previewToken = null) => {
     const lots = selectedLots[signalId] || 1;
     const tradeType = selectedTradeTypes[signalId] || 'FUTURE';
     const mode = selectedModes[signalId] || 'PAPER';
@@ -147,20 +147,74 @@ export default function FeedScreen({ session, purgeTrigger }) {
           signal_id: signalId,
           trade_type: tradeType,
           mode: mode,
-          lots: lots
+          lots: lots,
+          preview_token: previewToken,
+          idempotency_key: previewToken ? previewToken.slice(-80) : undefined,
         })
       });
       const text = await response.text();
       let resData;
       try { resData = JSON.parse(text); } catch { resData = null; }
       if (response.ok && resData) {
-        alert(`Success: Order executed for ${resData.symbol}. Traded ${lots} Lots (${resData.qty} Qty) in ${resData.mode} mode!`);
+        const title = resData.mode === 'LIVE' ? 'Order submitted' : 'Paper trade opened';
+        Alert.alert(title, `${resData.symbol}\n${lots} Lots (${resData.qty} Qty)\n${resData.order_status}`);
         fetchSignals();
       } else {
-        alert(`Error: ${resData?.detail || 'Order execution failed'}`);
+        Alert.alert('Order failed', resData?.detail || 'Order execution failed');
       }
     } catch (error) {
-      alert(`Network error: ${error.message}`);
+      Alert.alert('Network error', error.message);
+    } finally {
+      setSubmitting(prev => ({ ...prev, [signalId]: false }));
+    }
+  };
+
+  const handleExecuteOrder = async (signalId) => {
+    const lots = selectedLots[signalId] || 1;
+    const tradeType = selectedTradeTypes[signalId] || 'FUTURE';
+    const mode = selectedModes[signalId] || 'PAPER';
+    if (mode !== 'LIVE') {
+      await submitOrder(signalId);
+      return;
+    }
+    if (!brokerStatus.live_enabled) {
+      Alert.alert('Live trading unavailable', 'Connect an approved Alice Blue account before placing live orders.');
+      return;
+    }
+    if (!consentSigned) {
+      Alert.alert('Consent required', 'Sign today\'s trading consent before placing a live order.');
+      return;
+    }
+
+    setSubmitting(prev => ({ ...prev, [signalId]: true }));
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (session?.access_token) headers.Authorization = `Bearer ${session.access_token}`;
+      const response = await fetch(`${BACKEND_URL}/api/broker/order-preview`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ signal_id: signalId, trade_type: tradeType, mode, lots }),
+      });
+      const text = await response.text();
+      let preview;
+      try { preview = JSON.parse(text); } catch { preview = null; }
+      if (!response.ok || !preview?.preview_token) {
+        Alert.alert('Preview failed', preview?.detail || 'The live order could not be prepared.');
+        return;
+      }
+      Alert.alert(
+        'Confirm Live Order',
+        `${preview.transaction_type} ${preview.symbol}\n${preview.quantity} Qty (${preview.lots} Lots)\nLIMIT at Rs ${Number(preview.limit_price).toFixed(2)}\n${preview.product}`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Place Order',
+            onPress: () => submitOrder(signalId, preview.preview_token),
+          },
+        ],
+      );
+    } catch (error) {
+      Alert.alert('Network error', error.message);
     } finally {
       setSubmitting(prev => ({ ...prev, [signalId]: false }));
     }
@@ -248,8 +302,9 @@ export default function FeedScreen({ session, purgeTrigger }) {
 
     // Option symbol identification
     const isOptionSymbol = (sym) => (sym || '').includes(' CE') || (sym || '').includes(' PE');
-    const existingFuturePos = positions.find(pos => pos.signal_id === item.id && pos.status === 'OPEN' && !isOptionSymbol(pos.symbol));
-    const existingOptionPos = positions.find(pos => pos.signal_id === item.id && pos.status === 'OPEN' && isOptionSymbol(pos.symbol));
+    const activePositionStatuses = ['OPEN', 'PENDING', 'PARTIAL', 'EXIT_PENDING', 'EXIT_PARTIAL'];
+    const existingFuturePos = positions.find(pos => pos.signal_id === item.id && activePositionStatuses.includes(pos.status) && !isOptionSymbol(pos.symbol));
+    const existingOptionPos = positions.find(pos => pos.signal_id === item.id && activePositionStatuses.includes(pos.status) && isOptionSymbol(pos.symbol));
     
     const currentTypePos = tradeType === 'FUTURE' ? existingFuturePos : existingOptionPos;
     const isTradeRunningForSelectedType = !!currentTypePos;
@@ -387,9 +442,13 @@ export default function FeedScreen({ session, purgeTrigger }) {
                   <Text style={[styles.toggleBtnText, mode === 'PAPER' && styles.toggleActiveText]}>PAPER</Text>
                 </TouchableOpacity>
                 <TouchableOpacity 
-                  style={[styles.toggleBtn, mode === 'LIVE' && styles.toggleActiveModeLive]}
-                  onPress={() => !isTradeRunningForSelectedType && setSelectedModes(prev => ({ ...prev, [item.id]: 'LIVE' }))}
-                  disabled={isTradeRunningForSelectedType}
+                  style={[
+                    styles.toggleBtn,
+                    mode === 'LIVE' && styles.toggleActiveModeLive,
+                    !brokerStatus.live_enabled && { opacity: 0.4 },
+                  ]}
+                  onPress={() => !isTradeRunningForSelectedType && brokerStatus.live_enabled && setSelectedModes(prev => ({ ...prev, [item.id]: 'LIVE' }))}
+                  disabled={isTradeRunningForSelectedType || !brokerStatus.live_enabled}
                 >
                   <Text style={[styles.toggleBtnText, mode === 'LIVE' && styles.toggleActiveText]}>LIVE</Text>
                 </TouchableOpacity>

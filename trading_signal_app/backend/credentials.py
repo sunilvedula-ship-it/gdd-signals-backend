@@ -3,10 +3,12 @@ import json
 import base64
 import hashlib
 from datetime import datetime
-from pathlib import Path
+
+from cryptography.fernet import Fernet
 
 # Supported Brokers definitions
 INDIAN_BROKERS = [
+    {"id": "aliceblue",     "name": "Alice Blue",        "api_name": "Alice Blue Vendor API", "fields": [], "connection_type": "sso"},
     {"id": "flattrade",     "name": "Flattrade",         "api_name": "Flattrade Pi API",  "fields": ["client_id", "api_key", "api_secret"]},
     {"id": "zerodha",       "name": "Zerodha",           "api_name": "Kite Connect",      "fields": ["api_key", "api_secret"]},
     {"id": "kotak",         "name": "Kotak Securities",  "api_name": "Kotak Neo API",      "fields": ["api_key", "api_secret", "consumer_key"]},
@@ -29,13 +31,34 @@ def _get_machine_key():
     raw = f"{platform.node()}-{os.getenv('USERNAME', os.getenv('USER', 'default'))}"
     return hashlib.sha256(raw.encode()).digest()
 
+
+def _get_fernet():
+    secret = os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if not secret:
+        return None
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+    return Fernet(key)
+
 def obfuscate(text):
+    fernet = _get_fernet()
+    if fernet:
+        encrypted = fernet.encrypt(text.encode("utf-8")).decode("ascii")
+        return f"fernet:{encrypted}"
+
+    # Legacy fallback for local development. Production live trading requires
+    # CREDENTIAL_ENCRYPTION_KEY so credentials survive host changes securely.
     key = _get_machine_key()
     data = text.encode('utf-8')
     obfuscated = bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
     return base64.b64encode(obfuscated).decode('ascii')
 
 def deobfuscate(encoded):
+    if encoded.startswith("fernet:"):
+        fernet = _get_fernet()
+        if not fernet:
+            raise ValueError("CREDENTIAL_ENCRYPTION_KEY is required to decrypt broker credentials")
+        return fernet.decrypt(encoded.split(":", 1)[1].encode("ascii")).decode("utf-8")
+
     key = _get_machine_key()
     data = base64.b64decode(encoded.encode('ascii'))
     original = bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
@@ -132,7 +155,9 @@ class AppCredentialsManager:
         }
         
     def get_active_broker(self):
-        for broker in INDIAN_BROKERS:
-            if self.has_credentials(broker['id']):
-                return broker['id']
-        return None
+        supported = {broker["id"] for broker in INDIAN_BROKERS}
+        cred = self.db.query(self.model).filter(
+            self.model.user_id == self.user_id,
+            self.model.broker_id.in_(supported)
+        ).order_by(self.model.updated_at.desc(), self.model.id.desc()).first()
+        return cred.broker_id if cred else None

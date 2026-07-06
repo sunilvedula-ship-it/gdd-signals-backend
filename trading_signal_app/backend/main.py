@@ -1,17 +1,33 @@
 import os
 import json
 import math
+import html
+import secrets
+from urllib.parse import quote
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 
-from backend.database import init_db, get_db, Signal, Position, DailyConsent, User
+from backend.database import init_db, get_db, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
+from backend.aliceblue_client import (
+    AliceBlueError,
+    AliceBlueOrderStatusUnknown,
+    exchange_vendor_session,
+    get_funds as get_aliceblue_funds,
+    get_order_history as get_aliceblue_order_history,
+    get_vendor_login_url,
+    is_vendor_configured as is_aliceblue_vendor_configured,
+    place_order as place_aliceblue_order,
+    prepare_order as prepare_aliceblue_order,
+)
+from backend.security import SignedTokenError, create_signed_token, env_flag, verify_signed_token
 from backend.signal_rules import resolve_trade_type, resolve_webhook_execution_mode
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -85,10 +101,10 @@ def startup_event():
         db.add(user)
         db.commit()
     
-    # Auto-insert daily consent for User 1 to make local webhook simulator work out-of-the-box
+    # Local simulator convenience is explicitly opt-in and never enabled in production by default.
     ist_now = get_ist_time()
     today_str = ist_now.date().isoformat()
-    if not db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.user_id == 1).first():
+    if env_flag("ALLOW_SANDBOX_AUTH") and not db.query(DailyConsent).filter(DailyConsent.date == today_str, DailyConsent.user_id == 1).first():
         consent = DailyConsent(
             date=today_str,
             agreement_text_version="v1.0",
@@ -130,8 +146,8 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.split(" ")[1]
         
-    if not token:
-        # Fallback to sandbox user (User ID 1) for local web simulator
+    if not token and env_flag("ALLOW_SANDBOX_AUTH"):
+        # Explicit local-only fallback for the web simulator.
         user = db.query(User).filter(User.id == 1).first()
         if not user:
             user = User(
@@ -145,6 +161,9 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
             db.commit()
             db.refresh(user)
         return user
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
         
     # Verify token
     user_info = get_user_from_token(token)
@@ -569,7 +588,7 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
     if pos.real_or_paper.upper() == "LIVE":
         from backend.credentials import AppCredentialsManager
         mgr = AppCredentialsManager(db, user_id=pos.user_id)
-        active_broker = mgr.get_active_broker()
+        active_broker = pos.broker_id or mgr.get_active_broker()
         if active_broker == "flattrade":
             opp_direction = "SHORT" if pos.direction == "LONG" else "LONG"
             res = place_flattrade_order(
@@ -583,6 +602,78 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
             )
             if res.get("status") == "error":
                 raise Exception(res.get("message"))
+        elif active_broker == "aliceblue":
+            opp_direction = "SHORT" if pos.direction == "LONG" else "LONG"
+            existing_exit = db.query(BrokerOrder).filter(
+                BrokerOrder.user_id == pos.user_id,
+                BrokerOrder.position_id == pos.id,
+                BrokerOrder.order_kind == "EXIT",
+            ).first()
+            if existing_exit and existing_exit.status in {"PENDING", "SUBMITTED", "UNKNOWN"}:
+                raise Exception("An exit order is already pending at Alice Blue")
+
+            try:
+                prepared = prepare_aliceblue_order(
+                    symbol=pos.symbol,
+                    direction=opp_direction,
+                    lots=float(pos.lot_size or 1),
+                    quantity=int(pos.qty),
+                    price=exit_price,
+                    trade_type=pos.trade_type or "INTRADAY",
+                )
+            except AliceBlueError as exc:
+                raise Exception(str(exc)) from exc
+
+            exit_order = existing_exit or BrokerOrder(
+                user_id=pos.user_id,
+                signal_id=pos.signal_id,
+                position_id=pos.id,
+                broker_id="aliceblue",
+                idempotency_key=f"exit-{pos.id}",
+                order_kind="EXIT",
+                symbol=pos.symbol,
+                created_at=get_ist_time(),
+            )
+            exit_order.broker_trading_symbol = prepared["trading_symbol"]
+            exit_order.broker_instrument_id = prepared["instrument_id"]
+            exit_order.transaction_type = prepared["transaction_type"]
+            exit_order.quantity = prepared["quantity"]
+            exit_order.limit_price = prepared["limit_price"]
+            exit_order.status = "PENDING"
+            exit_order.updated_at = get_ist_time()
+            if not existing_exit:
+                db.add(exit_order)
+            db.commit()
+
+            try:
+                result = place_aliceblue_order(
+                    pos.user_id,
+                    db,
+                    prepared,
+                    order_tag=f"GDD-EXIT-{pos.id}",
+                )
+            except AliceBlueOrderStatusUnknown as exc:
+                exit_order.status = "UNKNOWN"
+                exit_order.broker_response = json.dumps({"error": str(exc)})
+                exit_order.updated_at = get_ist_time()
+                db.commit()
+                raise Exception(str(exc)) from exc
+            except AliceBlueError as exc:
+                exit_order.status = "REJECTED"
+                exit_order.broker_response = json.dumps({"error": str(exc)})
+                exit_order.updated_at = get_ist_time()
+                db.commit()
+                raise Exception(str(exc)) from exc
+
+            exit_order.status = "SUBMITTED"
+            exit_order.broker_order_id = result["broker_order_id"]
+            exit_order.broker_response = json.dumps(result.get("broker_response", {}))
+            exit_order.updated_at = get_ist_time()
+            pos.exit_broker_order_id = result["broker_order_id"]
+            pos.exit_order_status = "SUBMITTED"
+            pos.status = "EXIT_PENDING"
+            db.commit()
+            return pos.pnl
         
     pos.exit_price = round(exit_price, 2)
     pos.exit_time = get_ist_time()
@@ -1445,13 +1536,93 @@ def is_usd_asset(symbol: str) -> bool:
     s = symbol.upper().strip()
     return "USD" in s or "USDT" in s or s in ["BTC", "ETH", "SOL", "ADA", "XRP"]
 
+
+def reconcile_pending_aliceblue_positions(user_id: int, db: Session) -> None:
+    pending = db.query(Position).filter(
+        Position.user_id == user_id,
+        Position.broker_id == "aliceblue",
+        Position.status.in_(["PENDING", "PARTIAL", "EXIT_PENDING", "EXIT_PARTIAL"]),
+    ).all()
+    changed = False
+    for position in pending:
+        broker_order_id = (
+            position.entry_broker_order_id
+            if position.status in {"PENDING", "PARTIAL"}
+            else position.exit_broker_order_id
+        )
+        if not broker_order_id:
+            continue
+        try:
+            history = get_aliceblue_order_history(user_id, db, broker_order_id)
+        except AliceBlueError:
+            continue
+
+        broker_status = history["status"]
+        order_row = db.query(BrokerOrder).filter(
+            BrokerOrder.user_id == user_id,
+            BrokerOrder.broker_order_id == broker_order_id,
+        ).first()
+        if order_row:
+            order_row.status = broker_status
+            order_row.broker_response = json.dumps(history.get("raw", {}))
+            order_row.updated_at = get_ist_time()
+
+        filled_quantity = history["filled_quantity"]
+        average_price = history["average_price"]
+        if position.status in {"PENDING", "PARTIAL"}:
+            position.entry_order_status = broker_status
+            position.entry_filled_qty = filled_quantity
+            if filled_quantity > 0:
+                position.qty = filled_quantity
+                if average_price > 0:
+                    position.entry_price = average_price
+            if broker_status in {"COMPLETE", "COMPLETED", "FILLED"}:
+                position.status = "OPEN"
+            elif broker_status in {"REJECTED", "CANCELLED", "CANCELED"}:
+                position.status = "OPEN" if filled_quantity > 0 else "REJECTED"
+            elif filled_quantity > 0:
+                position.status = "PARTIAL"
+        else:
+            position.exit_order_status = broker_status
+            position.exit_filled_qty = filled_quantity
+            if broker_status in {"COMPLETE", "COMPLETED", "FILLED"}:
+                position.status = "CLOSED"
+                position.exit_time = get_ist_time()
+                if average_price > 0:
+                    position.exit_price = average_price
+                if position.exit_price is not None:
+                    if position.direction == "LONG":
+                        position.pnl = round(position.pnl + (position.exit_price - position.entry_price) * position.qty, 2)
+                    else:
+                        position.pnl = round(position.pnl + (position.entry_price - position.exit_price) * position.qty, 2)
+            elif broker_status in {"REJECTED", "CANCELLED", "CANCELED"}:
+                if filled_quantity > 0 and average_price > 0:
+                    if position.direction == "LONG":
+                        position.pnl = round(position.pnl + (average_price - position.entry_price) * filled_quantity, 2)
+                    else:
+                        position.pnl = round(position.pnl + (position.entry_price - average_price) * filled_quantity, 2)
+                    position.qty = max(0, position.qty - filled_quantity)
+                if position.qty == 0:
+                    position.status = "CLOSED"
+                    position.exit_price = average_price or position.exit_price
+                    position.exit_time = get_ist_time()
+                else:
+                    position.status = "OPEN"
+            elif filled_quantity > 0:
+                position.status = "EXIT_PARTIAL"
+        changed = True
+    if changed:
+        db.commit()
+
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    reconcile_pending_aliceblue_positions(user.id, db)
     positions = db.query(Position).filter(Position.user_id == user.id).order_by(Position.entry_time.desc()).all()
     
     # Calculate stats
     closed_positions = [p for p in positions if p.status == "CLOSED"]
-    open_positions = [p for p in positions if p.status == "OPEN"]
+    active_statuses = {"OPEN", "PENDING", "PARTIAL", "EXIT_PENDING", "EXIT_PARTIAL"}
+    open_positions = [p for p in positions if p.status in active_statuses]
     
     # Calculate open positions details & accumulate PnL separately
     positions_data = []
@@ -1460,12 +1631,14 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
     
     # Process open positions
     for p in positions:
-        if p.status == "OPEN":
-            current_price = get_current_price(p.symbol, p.entry_price, db)
-            if p.direction == "LONG":
-                pnl = (current_price - p.entry_price) * p.qty
+        if p.status in active_statuses:
+            current_price = p.entry_price if p.status == "PENDING" else get_current_price(p.symbol, p.entry_price, db)
+            if p.status == "PENDING":
+                pnl = 0.0
+            elif p.direction == "LONG":
+                pnl = p.pnl + (current_price - p.entry_price) * p.qty
             else:
-                pnl = (p.entry_price - current_price) * p.qty
+                pnl = p.pnl + (p.entry_price - current_price) * p.qty
             
             if is_usd_asset(p.symbol):
                 total_pnl_usd += pnl
@@ -1487,7 +1660,10 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
                 "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY"
+                "trade_type": p.trade_type or "INTRADAY",
+                "broker_id": p.broker_id,
+                "broker_order_id": p.entry_broker_order_id,
+                "order_status": p.exit_order_status if p.status in {"EXIT_PENDING", "EXIT_PARTIAL"} else p.entry_order_status,
             })
         else:
             pnl = p.pnl
@@ -1510,7 +1686,10 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
                 "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY"
+                "trade_type": p.trade_type or "INTRADAY",
+                "broker_id": p.broker_id,
+                "broker_order_id": p.entry_broker_order_id,
+                "order_status": p.exit_order_status or p.entry_order_status,
             })
             
     total_trades = len(closed_positions)
@@ -1583,6 +1762,7 @@ def sign_consent(req: ConsentRequest, db: Session = Depends(get_db), user: User 
 @app.get("/api/credentials")
 def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     mgr = AppCredentialsManager(db, user_id=user.id)
+    active_broker = mgr.get_active_broker()
     broker_list = []
     for broker in INDIAN_BROKERS:
         has = mgr.has_credentials(broker['id'])
@@ -1592,7 +1772,10 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
             "name": broker["name"],
             "api_name": broker["api_name"],
             "fields": broker["fields"],
+            "connection_type": broker.get("connection_type", "credentials"),
+            "available": is_aliceblue_vendor_configured() if broker["id"] == "aliceblue" else True,
             "configured": has,
+            "active": active_broker == broker["id"],
             "info": masked
         })
     
@@ -1616,6 +1799,14 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
 
 @app.post("/api/credentials")
 def save_credentials(req: CredentialRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    supported = {broker["id"] for broker in INDIAN_BROKERS + CRYPTO_EXCHANGES}
+    if req.broker_id not in supported:
+        raise HTTPException(status_code=400, detail="Unsupported broker")
+    if req.broker_id == "aliceblue":
+        raise HTTPException(
+            status_code=400,
+            detail="Alice Blue must be connected through the secure broker login flow",
+        )
     mgr = AppCredentialsManager(db, user_id=user.id)
     success = mgr.save_credentials(
         broker_id=req.broker_id,
@@ -1633,6 +1824,133 @@ def delete_credentials(broker_id: str, db: Session = Depends(get_db), user: User
     if mgr.delete_credentials(broker_id):
         return {"status": "success", "broker_id": broker_id}
     raise HTTPException(status_code=404, detail="Credentials not found")
+
+
+@app.post("/api/broker/aliceblue/login-url")
+def aliceblue_login_url(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not is_aliceblue_vendor_configured():
+        raise HTTPException(status_code=503, detail="Alice Blue Vendor API is not configured yet")
+    if not os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="Broker credential encryption is not configured")
+
+    try:
+        nonce = secrets.token_urlsafe(24)
+        state = create_signed_token(
+            {"purpose": "aliceblue_sso", "user_id": user.id, "nonce": nonce},
+            600,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    db.add(BrokerAuthState(
+        nonce=nonce,
+        user_id=user.id,
+        broker_id="aliceblue",
+        expires_at=get_ist_time() + timedelta(minutes=10),
+        created_at=get_ist_time(),
+    ))
+    db.commit()
+
+    public_base = os.environ.get("PUBLIC_BACKEND_URL", "").rstrip("/")
+    if public_base:
+        start_url = f"{public_base}/api/broker/aliceblue/start?state={quote(state)}"
+    else:
+        start_url = f"{request.url_for('aliceblue_login_start')}?state={quote(state)}"
+    return {"login_url": start_url}
+
+
+@app.get("/api/broker/aliceblue/start")
+def aliceblue_login_start(state: str, db: Session = Depends(get_db)):
+    try:
+        payload = verify_signed_token(state)
+    except (SignedTokenError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if payload.get("purpose") != "aliceblue_sso":
+        raise HTTPException(status_code=400, detail="Invalid broker login state")
+    auth_state = db.query(BrokerAuthState).filter(
+        BrokerAuthState.nonce == payload.get("nonce"),
+        BrokerAuthState.user_id == payload.get("user_id"),
+        BrokerAuthState.broker_id == "aliceblue",
+        BrokerAuthState.used_at.is_(None),
+    ).first()
+    if not auth_state or auth_state.expires_at < get_ist_time():
+        raise HTTPException(status_code=400, detail="Broker login state has expired")
+
+    try:
+        login_url = get_vendor_login_url()
+    except AliceBlueError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    response = RedirectResponse(url=login_url, status_code=302)
+    response.set_cookie(
+        "aliceblue_auth_state",
+        state,
+        max_age=600,
+        httponly=True,
+        secure=not env_flag("ALLOW_SANDBOX_AUTH"),
+        samesite="lax",
+        path="/api/broker/aliceblue",
+    )
+    return response
+
+
+@app.get("/api/broker/aliceblue/callback")
+def aliceblue_callback(request: Request, db: Session = Depends(get_db)):
+    auth_code = request.query_params.get("authCode") or request.query_params.get("auth_code")
+    alice_user_id = request.query_params.get("userId") or request.query_params.get("user_id")
+    state = request.cookies.get("aliceblue_auth_state")
+    if not auth_code or not alice_user_id or not state:
+        return HTMLResponse(
+            content="<h2>Alice Blue login could not be linked. Please return to the app and try again.</h2>",
+            status_code=400,
+        )
+
+    try:
+        state_payload = verify_signed_token(state)
+        if state_payload.get("purpose") != "aliceblue_sso":
+            raise SignedTokenError("Invalid broker login state")
+        user = db.query(User).filter(User.id == int(state_payload["user_id"])).first()
+        if not user:
+            raise SignedTokenError("Application user was not found")
+        auth_state = db.query(BrokerAuthState).filter(
+            BrokerAuthState.nonce == state_payload.get("nonce"),
+            BrokerAuthState.user_id == user.id,
+            BrokerAuthState.broker_id == "aliceblue",
+            BrokerAuthState.used_at.is_(None),
+        ).first()
+        if not auth_state or auth_state.expires_at < get_ist_time():
+            raise SignedTokenError("Broker login state has expired or was already used")
+        auth_state.used_at = get_ist_time()
+        db.commit()
+        session = exchange_vendor_session(alice_user_id, auth_code)
+        AppCredentialsManager(db, user_id=user.id).save_credentials(
+            "aliceblue",
+            str(alice_user_id),
+            session["user_session"],
+            extra={
+                "client_id": session["client_id"],
+                "authorized_at": get_ist_time().isoformat(),
+                "connection_type": "vendor_sso",
+            },
+        )
+    except (AliceBlueError, SignedTokenError, RuntimeError, KeyError, ValueError) as exc:
+        response = HTMLResponse(
+            content=f"<h2>Alice Blue login failed</h2><p>{html.escape(str(exc))}</p>",
+            status_code=400,
+        )
+        response.delete_cookie("aliceblue_auth_state", path="/api/broker/aliceblue")
+        return response
+
+    response = HTMLResponse(content="""
+    <html><head><title>Alice Blue Connected</title><meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>body{font-family:Arial,sans-serif;background:#0a0e17;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.panel{max-width:420px;padding:28px;border:1px solid #273244;border-radius:8px;text-align:center}h1{color:#10b981;font-size:24px}p{color:#aab3c2;line-height:1.5}</style></head>
+    <body><div class="panel"><h1>Alice Blue connected</h1><p>Your trading account is linked. You can close this page and return to the app.</p></div></body></html>
+    """)
+    response.delete_cookie("aliceblue_auth_state", path="/api/broker/aliceblue")
+    return response
 
 @app.get("/api/broker/callback")
 def broker_callback(code: str, client: str = Query(None), db: Session = Depends(get_db)):
@@ -1710,7 +2028,7 @@ def broker_login_redirect(broker_id: str, token: str = Query(None), db: Session 
             supabase_uid = user_info.get("id")
             user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
             
-    if not user:
+    if not user and env_flag("ALLOW_SANDBOX_AUTH"):
         user = db.query(User).filter(User.id == 1).first()
         
     if not user:
@@ -1745,11 +2063,16 @@ def get_user_profile(db: Session = Depends(get_db), user: User = Depends(get_cur
         "trial_days_left": trial_days_left
     }
 
-class ExecuteOrderRequest(BaseModel):
+class OrderPreviewRequest(BaseModel):
     signal_id: int
     trade_type: str  # FUTURE or OPTION
     mode: str        # LIVE or PAPER
     lots: float
+
+
+class ExecuteOrderRequest(OrderPreviewRequest):
+    preview_token: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 def get_lot_size(symbol: str) -> int:
     sym = symbol.upper()
@@ -1776,30 +2099,103 @@ def get_lot_size(symbol: str) -> int:
     else:
         return 100
 
+
+def resolve_manual_trade(signal: Signal, trade_type: str, lots: float) -> dict:
+    trade_type = trade_type.upper()
+    if trade_type not in {"FUTURE", "OPTION"}:
+        raise HTTPException(status_code=400, detail="Trade type must be FUTURE or OPTION")
+    if lots <= 0 or int(lots) != lots or lots > 100:
+        raise HTTPException(status_code=400, detail="Lots must be a whole number between 1 and 100")
+
+    sym_upper = signal.symbol.upper()
+    is_crypto = any(value in sym_upper for value in ["BTC", "ETH", "SOL", "USD", "USDT"])
+    qty = lots if is_crypto else lots * get_lot_size(signal.symbol)
+
+    if trade_type == "OPTION":
+        step = 50 if "NIFTY" in sym_upper and "BANKNIFTY" not in sym_upper else 100
+        underlying_price = get_live_market_price(signal.symbol) or signal.price
+        opt_strike = int(round(underlying_price / step) * step)
+        opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
+        ist_now = get_ist_time()
+        if "BANKNIFTY" in sym_upper:
+            expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+        elif "NIFTY" in sym_upper:
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        elif "SENSEX" in sym_upper:
+            expiry_date = get_next_weekly_expiry(ist_now, 3)
+        else:
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
+        entry_price = calculate_option_price_bs(
+            signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date
+        )
+        direction = "LONG"
+    else:
+        trade_symbol = signal.symbol
+        entry_price = get_live_market_price(signal.symbol) or signal.price
+        direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
+
+    return {
+        "trade_symbol": trade_symbol,
+        "entry_price": float(entry_price),
+        "direction": direction,
+        "qty": float(qty),
+        "lots": int(lots),
+        "contract_type": trade_type,
+    }
+
+
+BROKER_FUNDS_CACHE = {}
+
+
+def get_cached_broker_balance(user_id: int, broker_id: str, db: Session) -> Optional[float]:
+    cache_key = (user_id, broker_id)
+    now = datetime.utcnow()
+    cached = BROKER_FUNDS_CACHE.get(cache_key)
+    if cached and (now - cached[1]).total_seconds() < 30:
+        return cached[0]
+    balance = None
+    if broker_id == "aliceblue":
+        try:
+            balance = get_aliceblue_funds(user_id, db)
+        except AliceBlueError:
+            balance = None
+    BROKER_FUNDS_CACHE[cache_key] = (balance, now)
+    return balance
+
 @app.get("/api/broker/status")
 def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     mgr = AppCredentialsManager(db, user_id=user.id)
     active_id = mgr.get_active_broker()
     
     # Calculate open positions combined live open P&L
-    positions = db.query(Position).filter(Position.status == "OPEN", Position.user_id == user.id).all()
+    positions = db.query(Position).filter(
+        Position.status.in_(["OPEN", "PENDING", "PARTIAL", "EXIT_PENDING", "EXIT_PARTIAL"]),
+        Position.user_id == user.id,
+    ).all()
     combined_pnl = 0.0
     for p in positions:
+        if p.status == "PENDING":
+            continue
         current_price = get_current_price(p.symbol, p.entry_price, db)
         if p.direction == "LONG":
-            pnl = (current_price - p.entry_price) * p.qty
+            pnl = p.pnl + (current_price - p.entry_price) * p.qty
         else:
-            pnl = (p.entry_price - current_price) * p.qty
+            pnl = p.pnl + (p.entry_price - current_price) * p.qty
         combined_pnl += pnl
             
     if active_id:
         masked = mgr.get_masked_info(active_id)
+        live_enabled = env_flag("LIVE_TRADING_ENABLED") and active_id == "aliceblue"
+        balance = get_cached_broker_balance(user.id, active_id, db)
         return {
             "status": "linked",
             "broker_id": active_id,
-            "broker_name": masked["broker_id"].capitalize(),
-            "balance": 245000.00,  # Simulated active margin balance
-            "mode": "LIVE",
+            "broker_name": "Alice Blue" if active_id == "aliceblue" else masked["broker_id"].capitalize(),
+            "balance": balance or 0.0,
+            "balance_available": balance is not None,
+            "mode": "LIVE" if live_enabled else "LINKED",
+            "live_enabled": live_enabled,
             "combined_open_pnl": round(combined_pnl, 2)
         }
     else:
@@ -1809,11 +2205,96 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
             "broker_name": "Sandbox Broker",
             "balance": 1000000.00,  # 10 Lakh INR sandbox capital
             "mode": "SANDBOX",
+            "live_enabled": False,
             "combined_open_pnl": round(combined_pnl, 2)
         }
 
+
+def require_daily_live_consent(user_id: int, db: Session) -> None:
+    today_str = get_ist_time().date().isoformat()
+    consent = db.query(DailyConsent).filter(
+        DailyConsent.date == today_str,
+        DailyConsent.user_id == user_id,
+        DailyConsent.consent_given == True,
+    ).first()
+    if not consent:
+        raise HTTPException(
+            status_code=403,
+            detail="Daily trading consent must be signed before placing a live order",
+        )
+
+
+@app.post("/api/broker/order-preview")
+def preview_broker_order(
+    req: OrderPreviewRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if req.mode.upper() != "LIVE":
+        raise HTTPException(status_code=400, detail="Order preview is only required for live orders")
+    if not env_flag("LIVE_TRADING_ENABLED"):
+        raise HTTPException(status_code=503, detail="Live trading is not enabled on the server")
+    max_live_lots = max(1, int(os.environ.get("MAX_LIVE_LOTS_PER_ORDER", "10")))
+    if req.lots > max_live_lots:
+        raise HTTPException(status_code=400, detail=f"Live orders are limited to {max_live_lots} lots")
+    require_daily_live_consent(user.id, db)
+
+    manager = AppCredentialsManager(db, user_id=user.id)
+    if manager.get_active_broker() != "aliceblue":
+        raise HTTPException(status_code=400, detail="Connect Alice Blue before previewing a live order")
+    signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    if signal.action.upper() not in {"LONG", "SHORT", "BUY"}:
+        raise HTTPException(status_code=400, detail="Only active entry signals can be traded")
+
+    resolved = resolve_manual_trade(signal, req.trade_type, req.lots)
+    try:
+        prepared = prepare_aliceblue_order(
+            symbol=resolved["trade_symbol"],
+            direction=resolved["direction"],
+            lots=req.lots,
+            price=resolved["entry_price"],
+            trade_type=signal.trade_type or "INTRADAY",
+        )
+        preview_token = create_signed_token(
+            {
+                "purpose": "live_order_preview",
+                "user_id": user.id,
+                "signal_id": signal.id,
+                "trade_type": req.trade_type.upper(),
+                "mode": "LIVE",
+                "lots": int(req.lots),
+                "prepared": prepared,
+            },
+            90,
+        )
+    except (AliceBlueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "ready",
+        "preview_token": preview_token,
+        "broker_name": prepared["broker_name"],
+        "symbol": prepared["trading_symbol"],
+        "exchange": prepared["exchange"],
+        "transaction_type": prepared["transaction_type"],
+        "quantity": prepared["quantity"],
+        "lots": prepared["lots"],
+        "lot_size": prepared["lot_size"],
+        "order_type": prepared["order_type"],
+        "limit_price": prepared["limit_price"],
+        "product": prepared["product"],
+        "expires_in_seconds": 90,
+    }
+
 @app.post("/api/broker/execute")
 def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mode = req.mode.upper()
+    contract_type = req.trade_type.upper()
+    if mode not in {"LIVE", "PAPER"}:
+        raise HTTPException(status_code=400, detail="Mode must be LIVE or PAPER")
+
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
@@ -1825,14 +2306,39 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             detail="This is an exit signal (Sell/Cover). Entries are only allowed on Long or Short signals."
         )
 
-    # Check if user has credentials linked when mode is LIVE
-    if req.mode.upper() == "LIVE":
+    preview_payload = None
+    prepared_live_order = None
+    active_broker = None
+    if mode == "LIVE":
+        if not env_flag("LIVE_TRADING_ENABLED"):
+            raise HTTPException(status_code=503, detail="Live trading is not enabled on the server")
+        require_daily_live_consent(user.id, db)
         mgr = AppCredentialsManager(db, user_id=user.id)
-        if not mgr.get_active_broker():
+        active_broker = mgr.get_active_broker()
+        if active_broker != "aliceblue":
             raise HTTPException(
                 status_code=400,
-                detail="No API Credentials configured. Please configure your broker credentials under the Auto-Trade tab before executing a live order."
+                detail="Connect Alice Blue before executing a live order",
             )
+        if not req.preview_token:
+            raise HTTPException(status_code=400, detail="A fresh live-order preview is required")
+        try:
+            preview_payload = verify_signed_token(req.preview_token)
+        except (SignedTokenError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        expected = {
+            "purpose": "live_order_preview",
+            "user_id": user.id,
+            "signal_id": signal.id,
+            "trade_type": contract_type,
+            "mode": "LIVE",
+            "lots": int(req.lots),
+        }
+        if any(preview_payload.get(key) != value for key, value in expected.items()):
+            raise HTTPException(status_code=400, detail="Live-order preview no longer matches this order")
+        prepared_live_order = preview_payload.get("prepared")
+        if not isinstance(prepared_live_order, dict):
+            raise HTTPException(status_code=400, detail="Live-order preview is incomplete")
 
     # Check if the signal is still active (no subsequent exit alert on the symbol matching direction)
     exit_actions = ["EXIT", "CLOSE"]
@@ -1851,11 +2357,12 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         
     # Check duplicate trade prevention per signal and contract type separately
     existing = None
-    if req.trade_type == "OPTION":
+    if contract_type == "OPTION":
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
             Position.user_id == user.id,
-            Position.real_or_paper == req.mode,
+            Position.real_or_paper == mode,
+            Position.status != "REJECTED",
             (Position.symbol.like("% CE") | Position.symbol.like("% PE") | Position.symbol.like("%CE%") | Position.symbol.like("%PE%"))
         ).first()
     else:
@@ -1863,7 +2370,8 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         existing = db.query(Position).filter(
             Position.signal_id == req.signal_id,
             Position.user_id == user.id,
-            Position.real_or_paper == req.mode,
+            Position.real_or_paper == mode,
+            Position.status != "REJECTED",
             ~Position.symbol.like("% CE"),
             ~Position.symbol.like("% PE"),
             ~Position.symbol.like("%CE%"),
@@ -1874,60 +2382,79 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         lots_used = existing.lot_size or 1
         raise HTTPException(
             status_code=400, 
-            detail=f"A {req.trade_type} trade is already running on this signal with {lots_used} lots. You cannot place another {req.trade_type} trade on the same signal."
+            detail=f"A {contract_type} trade is already running on this signal with {lots_used} lots. You cannot place another {contract_type} trade on the same signal."
         )
-        
-    # Calculate Qty based on Lots
-    sym_upper = signal.symbol.upper()
-    is_crypto = "BTC" in sym_upper or "ETH" in sym_upper or "SOL" in sym_upper or "USD" in sym_upper or "USDT" in sym_upper
-    
-    if is_crypto:
-        qty = req.lots
-    else:
-        qty = req.lots * get_lot_size(signal.symbol)
-        
-    # Strike and premium / entry price resolution
-    if req.trade_type == "OPTION":
-        step = 50 if "NIFTY" in sym_upper else 100
-        underlying_price = get_live_market_price(signal.symbol) or signal.price
-        opt_strike = int(round(underlying_price / step) * step)
-        opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
-        
-        # Determine expiry date
-        ist_now = get_ist_time()
-        if sym_upper == "BANKNIFTY":
-            expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
-        elif sym_upper == "NIFTY":
-            expiry_date = get_next_weekly_expiry(ist_now, 1)
-        elif sym_upper == "SENSEX":
-            expiry_date = get_next_weekly_expiry(ist_now, 3)
-        else:
-            expiry_date = get_next_weekly_expiry(ist_now, 1)
-            
-        trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-        
-        entry_price = calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date)
-        direction = "LONG"
-    else:
-        trade_symbol = signal.symbol
-        entry_price = get_live_market_price(signal.symbol) or signal.price
-        direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
-        
-    if req.mode.upper() == "LIVE":
-        active_broker = mgr.get_active_broker()
-        if active_broker == "flattrade":
-            res = place_flattrade_order(
-                user_id=user.id,
-                symbol=trade_symbol,
-                direction=direction,
-                qty=qty,
-                price=entry_price,
-                db=db,
-                trade_type=signal.trade_type
+
+    resolved = resolve_manual_trade(signal, contract_type, req.lots)
+    trade_symbol = resolved["trade_symbol"]
+    direction = resolved["direction"]
+    qty = resolved["qty"]
+    entry_price = resolved["entry_price"]
+    broker_order = None
+    broker_result = None
+
+    if mode == "LIVE":
+        if prepared_live_order.get("symbol") != trade_symbol:
+            raise HTTPException(status_code=400, detail="The selected contract changed; preview the order again")
+        qty = int(prepared_live_order["quantity"])
+        entry_price = float(prepared_live_order["limit_price"])
+        idempotency_key = (req.idempotency_key or preview_payload.get("nonce") or "")[:120]
+        if not idempotency_key:
+            raise HTTPException(status_code=400, detail="Order idempotency key is missing")
+
+        broker_order = BrokerOrder(
+            user_id=user.id,
+            signal_id=signal.id,
+            broker_id="aliceblue",
+            idempotency_key=idempotency_key,
+            order_kind="ENTRY",
+            symbol=trade_symbol,
+            broker_trading_symbol=prepared_live_order.get("trading_symbol"),
+            broker_instrument_id=prepared_live_order.get("instrument_id"),
+            transaction_type=prepared_live_order.get("transaction_type"),
+            quantity=qty,
+            limit_price=entry_price,
+            status="PENDING",
+            created_at=get_ist_time(),
+            updated_at=get_ist_time(),
+        )
+        db.add(broker_order)
+        try:
+            db.commit()
+            db.refresh(broker_order)
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="This live order request was already submitted. Refresh positions before trying again.",
+            ) from exc
+
+        try:
+            broker_result = place_aliceblue_order(
+                user.id,
+                db,
+                prepared_live_order,
+                order_tag=f"GDD-{signal.id}-{contract_type}",
             )
-            if res.get("status") == "error":
-                raise HTTPException(status_code=400, detail=f"Flattrade API Order Failed: {res.get('message')}")
-        
+        except AliceBlueOrderStatusUnknown as exc:
+            broker_order.status = "UNKNOWN"
+            broker_order.broker_response = json.dumps({"error": str(exc)})
+            broker_order.updated_at = get_ist_time()
+            db.commit()
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except AliceBlueError as exc:
+            broker_order.status = "REJECTED"
+            broker_order.broker_response = json.dumps({"error": str(exc)})
+            broker_order.updated_at = get_ist_time()
+            db.commit()
+            raise HTTPException(status_code=400, detail=f"Alice Blue order failed: {exc}") from exc
+
+        broker_order.status = "SUBMITTED"
+        broker_order.broker_order_id = broker_result["broker_order_id"]
+        broker_order.broker_response = json.dumps(broker_result.get("broker_response", {}))
+        broker_order.updated_at = get_ist_time()
+        db.commit()
+
     # Create the position
     new_pos = Position(
         user_id=user.id,
@@ -1937,21 +2464,33 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         lot_size=int(req.lots),
         entry_price=round(entry_price, 2),
         entry_time=get_ist_time(),
-        status="OPEN",
-        real_or_paper=req.mode,
+        status="PENDING" if mode == "LIVE" else "OPEN",
+        real_or_paper=mode,
         signal_id=req.signal_id,
         timeframe=signal.timeframe,
-        trade_type=signal.trade_type
+        trade_type=signal.trade_type,
+        broker_id="aliceblue" if mode == "LIVE" else None,
+        broker_instrument_id=prepared_live_order.get("instrument_id") if prepared_live_order else None,
+        broker_trading_symbol=prepared_live_order.get("trading_symbol") if prepared_live_order else None,
+        entry_broker_order_id=broker_result.get("broker_order_id") if broker_result else None,
+        entry_order_status="SUBMITTED" if broker_result else None,
     )
     db.add(new_pos)
     db.commit()
+    db.refresh(new_pos)
+    if broker_order:
+        broker_order.position_id = new_pos.id
+        broker_order.updated_at = get_ist_time()
+        db.commit()
     
     return {
         "status": "success",
         "symbol": trade_symbol,
         "qty": qty,
         "entry_price": entry_price,
-        "mode": req.mode
+        "mode": mode,
+        "broker_order_id": broker_result.get("broker_order_id") if broker_result else None,
+        "order_status": "SUBMITTED" if broker_result else "FILLED",
     }
 
 @app.post("/api/broker/manual-exit/{pos_id}")
@@ -1978,6 +2517,14 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
 
 @app.post("/api/admin/purge-test-data")
 def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    admin_emails = {
+        value.strip().lower()
+        for value in os.environ.get("ADMIN_EMAILS", "").split(",")
+        if value.strip()
+    }
+    is_local_admin = env_flag("ALLOW_SANDBOX_AUTH") and user.id == 1
+    if not is_local_admin and (not user.email or user.email.lower() not in admin_emails):
+        raise HTTPException(status_code=403, detail="Administrator access required")
     try:
         num_positions = db.query(Position).filter(Position.user_id == user.id).delete()
         num_signals = db.query(Signal).delete()
@@ -1995,10 +2542,9 @@ def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_curr
 @app.get("/api/admin/debug-info")
 def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     env_secrets = os.environ.get("VALID_SECRETS")
-    if env_secrets:
-        VALID_SECRETS = [s.strip() for s in env_secrets.split(",")]
-    else:
-        VALID_SECRETS = ["TradeSignal2024", "indian_market_5645c3c44e98ddb7ed7aee5f05482e6e9e910031", "8cf895aa0e3387d51d8c6c19f3dea05e02e2839b"]
+    if not env_secrets:
+        raise HTTPException(status_code=503, detail="Debug access is disabled")
+    VALID_SECRETS = [s.strip() for s in env_secrets.split(",")]
         
     if not secret or secret not in VALID_SECRETS:
         raise HTTPException(status_code=401, detail="Unauthorized debug request")
