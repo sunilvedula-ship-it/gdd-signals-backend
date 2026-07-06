@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, StatusBar, ActivityIndicator, Platform } from 'react-native';
+import { StyleSheet, View, Text, StatusBar, ActivityIndicator, Platform, useWindowDimensions } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -28,6 +28,9 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [initializing, setInitializing] = useState(true);
   const [purgeTrigger, setPurgeTrigger] = useState(0);
+  const { width, height } = useWindowDimensions();
+  const isLandscape = width > height;
+  const isTablet = width >= 768;
 
   useEffect(() => {
     // 1. Get initial session
@@ -76,15 +79,19 @@ export default function App() {
               headerTitleStyle: {
                 fontWeight: 'bold',
                 fontFamily: 'System',
+                fontSize: isLandscape ? 16 : 18,
               },
               tabBarStyle: {
                 backgroundColor: '#111827',
                 borderTopColor: '#1f2937',
                 ...(Platform.OS === 'ios' ? {
-                  height: 88,
-                  paddingBottom: 28,
-                  paddingTop: 8,
+                  height: isLandscape ? 58 : (isTablet ? 72 : 88),
+                  paddingBottom: isLandscape ? 5 : (isTablet ? 14 : 28),
+                  paddingTop: isLandscape ? 4 : 8,
                 } : {}),
+              },
+              tabBarLabelStyle: {
+                fontSize: isLandscape ? 10 : 11,
               },
               tabBarActiveTintColor: '#3b82f6',
               tabBarInactiveTintColor: '#9ca3af',

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator, TextInput } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator, TextInput, useWindowDimensions } from 'react-native';
 import { BACKEND_URL } from '../config';
 
 const formatSignalDate = (isoString) => {
@@ -122,6 +122,8 @@ const getGroupedHistory = (closedPos) => {
 };
 
 export default function PaperTradeScreen({ session, purgeTrigger }) {
+  const { width, height } = useWindowDimensions();
+  const isCompactLandscape = width > height && width < 900;
   const [positions, setPositions] = useState([]);
   const [stats, setStats] = useState({ total_pnl: 0, total_pnl_inr: 0, total_pnl_usd: 0, win_rate: 0, total_trades: 0 });
   const [mutedSymbols, setMutedSymbols] = useState([]);
@@ -660,9 +662,9 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, isCompactLandscape && styles.containerCompact]}>
       {/* Top Combined Performance Stats Bar */}
-      <View style={styles.statsContainer}>
+      <View style={[styles.statsContainer, isCompactLandscape && styles.statsContainerCompact]}>
         <View style={styles.statBox}>
           <Text style={styles.statLabel}>INR P&L</Text>
           <Text style={[styles.statValue, inrPnlStyle]}>
@@ -789,6 +791,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#070a13',
     padding: 14,
   },
+  containerCompact: {
+    padding: 10,
+  },
   loadingContainer: {
     flex: 1,
     backgroundColor: '#070a13',
@@ -804,6 +809,10 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 12,
     marginBottom: 16,
+  },
+  statsContainerCompact: {
+    paddingVertical: 8,
+    marginBottom: 10,
   },
   statBox: {
     alignItems: 'center',

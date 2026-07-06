@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { StyleSheet, View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, Image } from 'react-native';
+import { StyleSheet, View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, Image, useWindowDimensions } from 'react-native';
 import { supabase } from '../supabase';
 
 export default function LoginScreen() {
@@ -7,6 +7,8 @@ export default function LoginScreen() {
   const [otp, setOtp] = useState('');
   const [otpSent, setOtpSent] = useState(false);
   const [loading, setLoading] = useState(false);
+  const { width, height } = useWindowDimensions();
+  const useWideLayout = width >= 720 && width > height;
 
   // Send OTP SMS
   const handleSendOTP = async () => {
@@ -61,18 +63,22 @@ export default function LoginScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'} 
       style={styles.container}
     >
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        <View style={styles.header}>
+      <ScrollView
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={[styles.scrollContent, useWideLayout && styles.scrollContentWide]}
+      >
+        <View style={[styles.layout, useWideLayout && styles.layoutWide]}>
+        <View style={[styles.header, useWideLayout && styles.headerWide]}>
           <Image 
             source={require('../assets/logo.png')} 
-            style={styles.logo} 
+            style={[styles.logo, useWideLayout && styles.logoWide]}
             resizeMode="contain" 
           />
           <Text style={styles.title}>SKI Analytics</Text>
           <Text style={styles.subtitle}>Automated Trading & Real-Time Signals</Text>
         </View>
 
-        <View style={styles.card}>
+        <View style={[styles.card, useWideLayout && styles.cardWide]}>
           {!otpSent ? (
             <View>
               <Text style={styles.label}>Log in with Mobile Number</Text>
@@ -142,6 +148,7 @@ export default function LoginScreen() {
             </View>
           )}
         </View>
+        </View>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -157,14 +164,39 @@ const styles = StyleSheet.create({
     padding: 24,
     justifyContent: 'center',
   },
+  scrollContentWide: {
+    paddingVertical: 16,
+    paddingHorizontal: 40,
+  },
+  layout: {
+    width: '100%',
+    maxWidth: 520,
+    alignSelf: 'center',
+  },
+  layoutWide: {
+    maxWidth: 980,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   header: {
     alignItems: 'center',
     marginBottom: 32,
+  },
+  headerWide: {
+    flex: 1,
+    marginBottom: 0,
+    paddingRight: 32,
   },
   logo: {
     width: 150,
     height: 150,
     marginBottom: 16,
+  },
+  logoWide: {
+    width: 108,
+    height: 108,
+    marginBottom: 10,
   },
   title: {
     fontSize: 28,
@@ -190,6 +222,10 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 10,
     elevation: 8,
+  },
+  cardWide: {
+    flex: 1.15,
+    maxWidth: 520,
   },
   label: {
     fontSize: 14,

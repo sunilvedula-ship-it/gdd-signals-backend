@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity, Alert } from 'react-native';
+import { StyleSheet, View, Text, FlatList, ActivityIndicator, RefreshControl, TouchableOpacity, Alert, useWindowDimensions } from 'react-native';
 import { BACKEND_URL } from '../config';
 
 const formatSignalDate = (isoString) => {
@@ -20,6 +20,8 @@ const formatSignalDate = (isoString) => {
 };
 
 export default function FeedScreen({ session, purgeTrigger }) {
+  const { width, height } = useWindowDimensions();
+  const useTwoColumns = width >= 900 && width > height;
   const [signals, setSignals] = useState([]);
   const [brokerStatus, setBrokerStatus] = useState({ status: 'sandbox', broker_name: 'Sandbox Broker', balance: 1000000, mode: 'SANDBOX', combined_open_pnl: 0 });
   const [positions, setPositions] = useState([]);
@@ -328,7 +330,7 @@ export default function FeedScreen({ session, purgeTrigger }) {
     const isMuted = mutedSymbols.includes(baseSymbol);
 
     return (
-      <View style={[styles.card, cardStyle, isMuted && { opacity: 0.6 }]}>
+      <View style={[styles.card, useTwoColumns && styles.cardWide, cardStyle, isMuted && { opacity: 0.6 }]}>
         <View style={styles.cardHeader}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <Text style={styles.symbol}>{item.symbol}</Text>
@@ -519,7 +521,10 @@ export default function FeedScreen({ session, purgeTrigger }) {
       )}
 
       <FlatList
+        key={useTwoColumns ? 'two-columns' : 'one-column'}
         data={signals}
+        numColumns={useTwoColumns ? 2 : 1}
+        columnWrapperStyle={useTwoColumns ? styles.cardRow : undefined}
         keyExtractor={(item) => item.id.toString()}
         renderItem={renderItem}
         refreshControl={
@@ -556,6 +561,12 @@ const styles = StyleSheet.create({
     padding: 16,
     marginBottom: 12,
     borderLeftWidth: 4,
+  },
+  cardWide: {
+    flex: 1,
+  },
+  cardRow: {
+    gap: 12,
   },
   cardLong: {
     borderLeftColor: '#10b981',

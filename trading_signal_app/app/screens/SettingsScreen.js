@@ -8,6 +8,7 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
 
@@ -18,6 +19,8 @@ import { supabase } from '../supabase';
 export default function SettingsScreen({ session, onPurge }) {
   const [brokers, setBrokers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const { width, height } = useWindowDimensions();
+  const isLandscape = width > height;
 
   const authHeaders = (json = false) => {
     const headers = json ? { 'Content-Type': 'application/json' } : {};
@@ -148,7 +151,10 @@ export default function SettingsScreen({ session, onPurge }) {
   const aliceBlue = brokers.find(broker => broker.id === 'aliceblue');
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={[styles.content, isLandscape && styles.contentLandscape]}
+    >
       <Text style={styles.sectionTitle}>Broker Account</Text>
       <View style={styles.card}>
         <View style={styles.rowBetween}>
@@ -215,7 +221,8 @@ export default function SettingsScreen({ session, onPurge }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0a0e17' },
-  content: { padding: 16, paddingBottom: 32 },
+  content: { padding: 16, paddingBottom: 32, width: '100%', maxWidth: 960, alignSelf: 'center' },
+  contentLandscape: { paddingVertical: 10 },
   loadingContainer: {
     flex: 1,
     backgroundColor: '#0a0e17',

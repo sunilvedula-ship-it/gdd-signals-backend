@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator } from 'react-native';
+import { StyleSheet, View, Text, ScrollView, TouchableOpacity, ActivityIndicator, useWindowDimensions } from 'react-native';
 import { BACKEND_URL } from '../config';
 
 
 export default function ConsentScreen({ session }) {
   const [consentSigned, setConsentSigned] = useState(false);
   const [loading, setLoading] = useState(true);
+  const { width, height } = useWindowDimensions();
+  const isLandscape = width > height;
 
   const fetchConsent = async () => {
     try {
@@ -64,15 +66,15 @@ export default function ConsentScreen({ session }) {
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <View style={styles.consentCard}>
-        <View style={styles.iconContainer}>
+    <ScrollView style={styles.container} contentContainerStyle={[styles.content, isLandscape && styles.contentLandscape]}>
+      <View style={[styles.consentCard, isLandscape && styles.consentCardLandscape]}>
+        <View style={[styles.iconContainer, isLandscape && styles.iconContainerLandscape]}>
           <Text style={styles.icon}>🛡️</Text>
         </View>
         <Text style={styles.title}>Daily Compliance Consent</Text>
         <Text style={styles.date}>Date: {new Date().toISOString().split('T')[0]}</Text>
 
-        <ScrollView style={styles.scrollBox}>
+        <ScrollView style={[styles.scrollBox, isLandscape && styles.scrollBoxLandscape]}>
           <Text style={styles.scrollTitle}>Terms & Risk Disclosure</Text>
           <Text style={styles.scrollText}>
             I hereby authorize the auto-execution of alerts on my broker account for today. I fully acknowledge that:{"\n\n"}
@@ -113,6 +115,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     minHeight: '90%',
   },
+  contentLandscape: {
+    paddingVertical: 10,
+  },
   loadingContainer: {
     flex: 1,
     backgroundColor: '#0a0e17',
@@ -127,6 +132,12 @@ const styles = StyleSheet.create({
     padding: 20,
     alignItems: 'center',
   },
+  consentCardLandscape: {
+    width: '100%',
+    maxWidth: 760,
+    alignSelf: 'center',
+    paddingVertical: 14,
+  },
   iconContainer: {
     width: 60,
     height: 60,
@@ -135,6 +146,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 16,
+  },
+  iconContainerLandscape: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    marginBottom: 8,
   },
   icon: {
     fontSize: 24,
@@ -159,6 +176,10 @@ const styles = StyleSheet.create({
     padding: 12,
     width: '100%',
     marginBottom: 16,
+  },
+  scrollBoxLandscape: {
+    height: 108,
+    marginBottom: 10,
   },
   scrollTitle: {
     fontSize: 12,
