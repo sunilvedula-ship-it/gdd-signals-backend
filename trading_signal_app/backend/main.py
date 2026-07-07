@@ -666,6 +666,27 @@ def calculate_option_price_bs(underlying: str, strike: float, opt_type: str, liv
     price = black_scholes_option_price(S=live_underlying, K=strike, T=T, r=r, sigma=sigma, option_type=opt_type)
     return round(max(1.0, price), 2)
 
+def get_option_market_price_or_estimate(
+    option_symbol: str,
+    underlying: str,
+    strike: float,
+    opt_type: str,
+    underlying_price: Optional[float] = None,
+    expiry_date: Optional[date] = None,
+) -> tuple[float, str]:
+    live_option_price = get_live_market_price(option_symbol)
+    if live_option_price is not None and live_option_price > 0:
+        return round(float(live_option_price), 2), "MARKET_LTP"
+
+    index_price = underlying_price
+    if index_price is None or index_price <= 0 or index_price < 0.2 * strike:
+        index_price = get_live_market_price(underlying)
+    if index_price is None or index_price <= 0:
+        index_price = strike
+
+    estimated = calculate_option_price_bs(underlying, strike, opt_type, float(index_price), expiry_date=expiry_date)
+    return round(float(estimated), 2), "BS_FALLBACK"
+
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
@@ -719,7 +740,14 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session, re
         if index_exit_price > 0 and index_exit_price < 0.2 * strike:
             exit_price = index_exit_price
         else:
-            exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price, expiry_date=expiry_date)
+            exit_price, _source = get_option_market_price_or_estimate(
+                pos.symbol,
+                underlying,
+                strike,
+                opt_type,
+                underlying_price=index_exit_price,
+                expiry_date=expiry_date,
+            )
     else:
         exit_price = index_exit_price
         
@@ -1353,9 +1381,16 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         if price_val > 0 and price_val < 0.2 * opt_strike:
             opt_premium = price_val
         else:
-            # Price is index price or 0. Fetch index price and calculate BS premium
+            # Price is index price or 0. Fetch actual option premium first, then estimate only as fallback.
             index_p = price_val if price_val > 0 else (get_live_market_price(underlying_norm) or opt_strike)
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, index_p, expiry_date=expiry_date)
+            opt_premium, _price_source = get_option_market_price_or_estimate(
+                opt_symbol,
+                underlying_norm,
+                opt_strike,
+                opt_type,
+                underlying_price=index_p,
+                expiry_date=expiry_date,
+            )
             price_val = index_p
     elif has_options and price_val > 0:
         step = 50 if underlying_norm == "NIFTY" else 100
@@ -1377,8 +1412,15 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             else:
                 expiry_date = get_next_weekly_expiry(ist_now, 1)
                 
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
             opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
+            opt_premium, _price_source = get_option_market_price_or_estimate(
+                opt_symbol,
+                underlying_norm,
+                opt_strike,
+                opt_type,
+                underlying_price=price_val,
+                expiry_date=expiry_date,
+            )
             
     # Check for open positions on this symbol or its options
     # Save signal in database in IST
@@ -1596,29 +1638,65 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "trade_type": s.trade_type or "INTRADAY"
     } for s in filtered_signals]
 
+def build_tradingview_option_ticker(symbol: str) -> Optional[str]:
+    parsed = parse_option_symbol(symbol)
+    if not parsed.get("is_option") or not parsed.get("expiry_date"):
+        return None
+    opt_char = "C" if parsed["opt_type"] == "CE" else "P"
+    expiry = parsed["expiry_date"].strftime("%y%m%d")
+    underlying = parsed["underlying"]
+    strike = int(parsed["strike"])
+    return f"NSE:{underlying}{expiry}{opt_char}{strike}"
+
+def pick_tradingview_price(values: list) -> Optional[float]:
+    # columns: close, lp, last, bid, ask
+    for index in [0, 1, 2]:
+        try:
+            price = values[index]
+            if price is not None and float(price) > 0:
+                return float(price)
+        except (IndexError, TypeError, ValueError):
+            pass
+    try:
+        bid = values[3]
+        ask = values[4]
+        if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+            return (float(bid) + float(ask)) / 2.0
+    except (IndexError, TypeError, ValueError):
+        pass
+    return None
+
 def get_tradingview_price(symbol: str) -> Optional[float]:
     s = symbol.upper().strip()
     
     # 1. Map to TradingView ticker and scanner market
     tv_ticker = None
     market = "global"
+
+    parsed_option = parse_option_symbol(s)
+    option_ticker = build_tradingview_option_ticker(s)
+    if option_ticker:
+        tv_ticker = option_ticker
+        market = "global"
+    elif parsed_option.get("is_option"):
+        return None
     
-    if s in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
+    if not tv_ticker and s in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
         tv_ticker = "NSE:NIFTY1!"
         market = "futures"
-    elif s in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
+    elif not tv_ticker and s in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
         tv_ticker = "NSE:BANKNIFTY1!"
         market = "futures"
-    elif s in ["SENSEX", "BSX1!", "BSE:BSX1!", "BSE:SENSEX"]:
+    elif not tv_ticker and s in ["SENSEX", "BSX1!", "BSE:BSX1!", "BSE:SENSEX"]:
         tv_ticker = "BSE:BSX1!"
         market = "futures"
-    elif s in ["BTCUSD", "BTC", "BTC-USD", "BINANCE:BTCUSD"]:
+    elif not tv_ticker and s in ["BTCUSD", "BTC", "BTC-USD", "BINANCE:BTCUSD"]:
         tv_ticker = "BINANCE:BTCUSD"
         market = "crypto"
-    elif s in ["GOLDM1!", "GOLD", "GOLDM", "MCX:GOLDM1!"]:
+    elif not tv_ticker and s in ["GOLDM1!", "GOLD", "GOLDM", "MCX:GOLDM1!"]:
         tv_ticker = "MCX:GOLDM1!"
         market = "futures"
-    elif s in ["CRUDE", "CRUDEOIL", "MCX:CRUDEOIL1!"]:
+    elif not tv_ticker and s in ["CRUDE", "CRUDEOIL", "MCX:CRUDEOIL1!"]:
         tv_ticker = "MCX:CRUDEOIL1!"
         market = "futures"
         
@@ -1647,7 +1725,7 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
             "tickers": [tv_ticker],
             "query": {"types": []}
         },
-        "columns": ["close"]
+        "columns": ["close", "lp", "last", "bid", "ask"]
     }
     
     import urllib.request
@@ -1667,13 +1745,17 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
             res_data = json.loads(response.read().decode("utf-8"))
             data_list = res_data.get("data", [])
             if data_list:
-                return float(data_list[0]["d"][0])
+                return pick_tradingview_price(data_list[0].get("d", []))
     except Exception as e:
         print(f"Error fetching TradingView price for {tv_ticker} on {market}: {e}")
     return None
 
 def map_symbol_to_google_ticker(symbol: str) -> Optional[str]:
     s_upper = symbol.upper().strip()
+    option_ticker = build_tradingview_option_ticker(s_upper)
+    if option_ticker:
+        compact = option_ticker.split(":", 1)[1]
+        return f"{compact}:NSE"
     if s_upper in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
         return "NIFTY_50:INDEXNSE"
     elif s_upper in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
@@ -1686,6 +1768,9 @@ def map_symbol_to_google_ticker(symbol: str) -> Optional[str]:
 
 def map_symbol_to_yahoo_ticker(symbol: str) -> str:
     s_upper = symbol.upper().strip()
+    option_ticker = build_tradingview_option_ticker(s_upper)
+    if option_ticker:
+        return f"{option_ticker.split(':', 1)[1]}.NS"
     if s_upper in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
         return "^NSEI"
     elif s_upper in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
@@ -1777,6 +1862,9 @@ def _fetch_live_price_no_cache(symbol: str) -> dict:
         price = get_google_finance_price(g_ticker)
         if price is not None:
             return {"price": price, "previous_close": None, "source": "GoogleFinance"}
+
+    if parse_option_symbol(symbol).get("is_option"):
+        return {}
             
     # 3. Fallback to Yahoo Finance
     y_ticker = map_symbol_to_yahoo_ticker(symbol)
@@ -1809,7 +1897,14 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
             live_underlying = latest_signal.price if latest_signal else strike
             
-        current_premium = calculate_option_price_bs(underlying, strike, opt_type, live_underlying, expiry_date=expiry_date)
+        current_premium, _price_source = get_option_market_price_or_estimate(
+            symbol,
+            underlying,
+            strike,
+            opt_type,
+            underlying_price=live_underlying,
+            expiry_date=expiry_date,
+        )
         return round(max(1.0, current_premium), 2)
         
     # 2. Standard future/equity/crypto price resolution
@@ -2466,8 +2561,13 @@ def resolve_manual_trade(signal: Signal, trade_type: str, lots: float) -> dict:
         else:
             expiry_date = get_next_weekly_expiry(ist_now, 1)
         trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-        entry_price = calculate_option_price_bs(
-            signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date
+        entry_price, _price_source = get_option_market_price_or_estimate(
+            trade_symbol,
+            signal.symbol,
+            opt_strike,
+            opt_type,
+            underlying_price=underlying_price,
+            expiry_date=expiry_date,
         )
         direction = "LONG"
     else:

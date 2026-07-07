@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
 from backend.database import AppAuthSession, BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
-from backend.main import app, get_ist_time, square_off_expired_intraday_positions
+from backend.main import app, build_tradingview_option_ticker, get_ist_time, get_tradingview_price, pick_tradingview_price, square_off_expired_intraday_positions
 
 
 class BankNiftyWebhookIntegrationTests(unittest.TestCase):
@@ -127,6 +127,56 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["order_status"], "FILLED")
+
+    def test_tradingview_option_ticker_and_bid_ask_midpoint(self):
+        self.assertEqual(
+            build_tradingview_option_ticker("NIFTY 07JUL26 24550 PE"),
+            "NSE:NIFTY260707P24550",
+        )
+        self.assertEqual(pick_tradingview_price([None, None, None, 74.5, 75.5]), 75.0)
+        self.assertIsNone(get_tradingview_price("NIFTY 24550 PE"))
+
+    def test_manual_option_order_uses_live_option_ltp(self):
+        db = SessionLocal()
+        try:
+            signal = Signal(
+                symbol="NIFTY",
+                action="SHORT",
+                price=24550,
+                source="TradingView",
+                source_name="option-ltp-test",
+                raw_payload="{}",
+                timeframe="5m",
+                trade_type="POSITIONAL",
+            )
+            db.add(signal)
+            db.commit()
+            signal_id = signal.id
+        finally:
+            db.close()
+
+        def fake_live_price(symbol):
+            if " PE" in symbol:
+                return 75.0
+            if symbol == "NIFTY":
+                return 24550.0
+            return None
+
+        with patch("backend.main.get_live_market_price", side_effect=fake_live_price):
+            response = self.client.post(
+                "/api/broker/execute",
+                json={"signal_id": signal_id, "trade_type": "OPTION", "mode": "PAPER", "lots": 1},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["entry_price"], 75.0)
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(Position.signal_id == signal_id).one()
+            self.assertTrue(position.symbol.endswith(" PE"))
+            self.assertEqual(position.entry_price, 75.0)
+        finally:
+            db.close()
 
     def test_live_order_is_locked_until_server_enablement(self):
         db = SessionLocal()
