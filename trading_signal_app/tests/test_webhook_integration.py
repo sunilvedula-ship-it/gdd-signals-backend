@@ -18,7 +18,7 @@ os.environ.pop("WEBHOOK_AUTO_EXECUTION_MODE", None)
 from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
-from backend.database import BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
+from backend.database import AppAuthSession, BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
 from backend.main import app, square_off_expired_intraday_positions
 
 
@@ -154,19 +154,23 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503, response.text)
 
     def test_configured_test_phone_can_login_with_common_password(self):
-        with patch.dict(os.environ, {"BROKER_AUTH_STATE_SECRET": "integration-signing-key"}, clear=False):
-            response = self.client.post(
-                "/api/auth/test-login",
-                json={"phone": "+91 9043055445", "password": "123456"},
-            )
+        response = self.client.post(
+            "/api/auth/test-login",
+            json={"phone": "+91 9043055445", "password": "123456"},
+        )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(response.json()["access_token"])
+        token = response.json()["access_token"]
+        self.assertTrue(token)
+        profile = self.client.get("/api/user", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(profile.status_code, 200, profile.text)
+        self.assertEqual(profile.json()["phone"], "+919043055445")
         db = SessionLocal()
         try:
             db.query(Position).filter(Position.user_id != 1).delete()
             test_user = db.query(User).filter(User.phone == "+919043055445").first()
             if test_user:
+                db.query(AppAuthSession).filter(AppAuthSession.user_id == test_user.id).delete()
                 db.delete(test_user)
             db.commit()
         finally:

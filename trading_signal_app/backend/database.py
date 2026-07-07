@@ -127,6 +127,18 @@ class BrokerLiveSetting(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class AppAuthSession(Base):
+    __tablename__ = 'app_auth_sessions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), index=True, nullable=False)
+    token_hash = Column(String, unique=True, index=True, nullable=False)
+    purpose = Column(String, default="test_login")
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class BrokerOrder(Base):
     __tablename__ = 'broker_orders'
     __table_args__ = (

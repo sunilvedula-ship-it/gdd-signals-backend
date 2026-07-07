@@ -5,6 +5,7 @@ import html
 import secrets
 import asyncio
 import ipaddress
+import hashlib
 from urllib.parse import quote
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
@@ -16,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 import requests
 
 
-from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState, BrokerLiveSetting
+from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState, BrokerLiveSetting, AppAuthSession
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
 from backend.aliceblue_client import (
@@ -165,6 +166,26 @@ def get_test_login_payload(token: str) -> Optional[dict]:
         return None
     return payload
 
+def app_auth_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+def get_app_session_user(token: str, db: Session) -> Optional[User]:
+    if not token:
+        return None
+    token_hash = app_auth_token_hash(token)
+    session_row = db.query(AppAuthSession).filter(
+        AppAuthSession.token_hash == token_hash,
+        AppAuthSession.revoked_at.is_(None),
+    ).first()
+    if not session_row or session_row.expires_at < get_ist_time():
+        return None
+    user = db.query(User).filter(User.id == session_row.user_id).first()
+    if not user:
+        return None
+    if session_row.purpose == "test_login" and not is_test_login_phone(user.phone):
+        return None
+    return user
+
 def get_user_from_token(token: str) -> Optional[dict]:
     import urllib.request
     import json
@@ -208,6 +229,10 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
 
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    app_session_user = get_app_session_user(token, db)
+    if app_session_user:
+        return app_session_user
 
     test_payload = get_test_login_payload(token)
     if test_payload:
@@ -267,18 +292,6 @@ def test_login(req: TestLoginRequest, db: Session = Depends(get_db)):
     if phone not in configured_test_login_phones() or req.password != expected_password:
         raise HTTPException(status_code=401, detail="Invalid test login")
 
-    try:
-        token = create_signed_token(
-            {
-                "purpose": "test_login",
-                "phone": phone,
-                "test_account": True,
-            },
-            60 * 60 * 24 * 30,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
     user = db.query(User).filter(User.phone == phone).first()
     if not user:
         user = User(
@@ -290,6 +303,17 @@ def test_login(req: TestLoginRequest, db: Session = Depends(get_db)):
         db.add(user)
         db.commit()
         db.refresh(user)
+
+    token = f"appt_{secrets.token_urlsafe(48)}"
+    expires_at = get_ist_time() + timedelta(days=30)
+    db.add(AppAuthSession(
+        user_id=user.id,
+        token_hash=app_auth_token_hash(token),
+        purpose="test_login",
+        expires_at=expires_at,
+        created_at=get_ist_time(),
+    ))
+    db.commit()
 
     return {
         "access_token": token,
@@ -3013,7 +3037,7 @@ def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User
     inspector = inspect(db.bind)
     
     tables_schema = {}
-    for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials", "broker_live_settings"]:
+    for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials", "broker_live_settings", "app_auth_sessions"]:
         columns = [{"name": col["name"], "type": str(col["type"])} for col in inspector.get_columns(table_name)]
         tables_schema[table_name] = columns
         
