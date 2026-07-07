@@ -6,7 +6,9 @@ import {
   Linking,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
+  TextInput,
   TouchableOpacity,
   useWindowDimensions,
   View,
@@ -16,9 +18,13 @@ import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
 
-export default function SettingsScreen({ session, onPurge }) {
+export default function SettingsScreen({ session, onLogout, onPurge }) {
   const [brokers, setBrokers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [savingStaticIp, setSavingStaticIp] = useState(false);
+  const [liveReadiness, setLiveReadiness] = useState(null);
+  const [staticIp, setStaticIp] = useState('');
+  const [staticIpRegistered, setStaticIpRegistered] = useState(false);
   const { width, height } = useWindowDimensions();
   const isLandscape = width > height;
 
@@ -41,11 +47,27 @@ export default function SettingsScreen({ session, onPurge }) {
       if (response.ok && data) {
         setBrokers(data.brokers || []);
       }
+      await fetchLiveReadiness(false);
     } catch (error) {
       console.warn('Error loading broker connection:', error.message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const fetchLiveReadiness = async (refreshIp = false) => {
+    const response = await fetch(`${BACKEND_URL}/api/broker/live-readiness?broker_id=aliceblue&refresh_ip=${refreshIp ? 'true' : 'false'}`, {
+      headers: authHeaders(),
+    });
+    const text = await response.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = null; }
+    if (response.ok && data) {
+      setLiveReadiness(data);
+      setStaticIp(data.static_ip || '');
+      setStaticIpRegistered(!!data.static_ip_registered);
+    }
+    return data;
   };
 
   useEffect(() => {
@@ -104,6 +126,40 @@ export default function SettingsScreen({ session, onPurge }) {
         },
       ],
     );
+  };
+
+  const saveStaticIp = async () => {
+    if (!staticIp.trim()) {
+      Alert.alert('Static IP required', 'Enter the approved public static IP.');
+      return;
+    }
+    setSavingStaticIp(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/broker/static-ip`, {
+        method: 'POST',
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          broker_id: 'aliceblue',
+          static_ip: staticIp.trim(),
+          registered_with_broker: staticIpRegistered,
+        }),
+      });
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (!response.ok || !data) {
+        Alert.alert('Static IP not saved', data?.detail || 'Could not save the static IP.');
+        return;
+      }
+      setLiveReadiness(data);
+      setStaticIp(data.static_ip || staticIp.trim());
+      setStaticIpRegistered(!!data.static_ip_registered);
+      Alert.alert(data.live_enabled ? 'Live ready' : 'Static IP saved', data.live_enabled ? 'Live orders are enabled for this account.' : (data.blockers?.[0] || 'Complete the remaining live setup steps.'));
+    } catch (error) {
+      Alert.alert('Network error', error.message);
+    } finally {
+      setSavingStaticIp(false);
+    }
   };
 
   const handlePurgeData = () => {
@@ -190,6 +246,69 @@ export default function SettingsScreen({ session, onPurge }) {
         )}
       </View>
 
+      <Text style={styles.sectionTitle}>Live Readiness</Text>
+      <View style={styles.card}>
+        <View style={styles.statusRow}>
+          <View style={[styles.statusDot, liveReadiness?.live_enabled ? styles.statusDotLive : styles.statusDotBlocked]} />
+          <View style={styles.statusTextWrap}>
+            <Text style={liveReadiness?.live_enabled ? styles.connectedTitle : styles.blockedTitle}>
+              {liveReadiness?.live_enabled ? 'Live trading ready' : 'Live trading locked'}
+            </Text>
+            <Text style={styles.cardText}>
+              {liveReadiness?.backend_outbound_ip ? `Backend IP: ${liveReadiness.backend_outbound_ip}` : 'Backend IP: checking'}
+            </Text>
+          </View>
+        </View>
+
+        <Text style={styles.inputLabel}>Approved Static IP</Text>
+        <TextInput
+          style={styles.input}
+          value={staticIp}
+          onChangeText={setStaticIp}
+          placeholder="Approved public IPv4"
+          placeholderTextColor="#64748b"
+          autoCapitalize="none"
+          keyboardType="numbers-and-punctuation"
+        />
+
+        <View style={styles.switchRow}>
+          <View style={styles.switchTextWrap}>
+            <Text style={styles.cardTitle}>Registered with broker/exchange</Text>
+            <Text style={styles.cardText}>Required before live orders are unlocked</Text>
+          </View>
+          <Switch
+            value={staticIpRegistered}
+            onValueChange={setStaticIpRegistered}
+            trackColor={{ false: '#334155', true: '#065f46' }}
+            thumbColor={staticIpRegistered ? '#10b981' : '#94a3b8'}
+          />
+        </View>
+
+        {liveReadiness?.blockers?.length ? (
+          <View style={styles.blockerBox}>
+            {liveReadiness.blockers.map((item, index) => (
+              <Text key={`${item}-${index}`} style={styles.blockerText}>{item}</Text>
+            ))}
+          </View>
+        ) : null}
+
+        <View style={styles.buttonRow}>
+          <TouchableOpacity
+            style={[styles.primaryButton, styles.buttonFlex, savingStaticIp && styles.buttonDisabled]}
+            onPress={saveStaticIp}
+            disabled={savingStaticIp}
+          >
+            <Text style={styles.primaryButtonText}>{savingStaticIp ? 'SAVING' : 'SAVE IP'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.outlineButton, styles.buttonFlex]}
+            onPress={() => fetchLiveReadiness(true)}
+          >
+            <Text style={styles.outlineButtonText}>REFRESH IP</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
       <Text style={styles.sectionTitle}>Strategies</Text>
       <View style={styles.card}>
         {[
@@ -206,7 +325,7 @@ export default function SettingsScreen({ session, onPurge }) {
       </View>
 
       <Text style={styles.sectionTitle}>Account</Text>
-      <TouchableOpacity style={styles.dangerButton} onPress={() => supabase.auth.signOut()}>
+      <TouchableOpacity style={styles.dangerButton} onPress={onLogout || (() => supabase.auth.signOut())}>
         <Text style={styles.dangerButtonText}>LOG OUT</Text>
       </TouchableOpacity>
 
@@ -251,7 +370,55 @@ const styles = StyleSheet.create({
   rowText: { flex: 1, paddingRight: 12 },
   statusRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 14 },
   statusDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: '#10b981', marginRight: 10 },
+  statusDotLive: { backgroundColor: '#10b981' },
+  statusDotBlocked: { backgroundColor: '#f59e0b' },
+  statusTextWrap: { flex: 1 },
   connectedTitle: { color: '#10b981', fontSize: 14, fontWeight: '700', marginBottom: 3 },
+  blockedTitle: { color: '#fbbf24', fontSize: 14, fontWeight: '700', marginBottom: 3 },
+  inputLabel: { color: '#cbd5e1', fontSize: 11, fontWeight: '700', marginBottom: 7 },
+  input: {
+    backgroundColor: '#0b111c',
+    borderColor: '#273244',
+    borderWidth: 1,
+    borderRadius: 6,
+    color: '#f8fafc',
+    fontSize: 14,
+    minHeight: 42,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+  },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginBottom: 12,
+  },
+  switchTextWrap: { flex: 1 },
+  blockerBox: {
+    backgroundColor: '#1c1917',
+    borderColor: '#78350f',
+    borderWidth: 1,
+    borderRadius: 6,
+    padding: 10,
+    marginBottom: 12,
+  },
+  blockerText: {
+    color: '#fbbf24',
+    fontSize: 11,
+    lineHeight: 16,
+    marginBottom: 3,
+  },
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  buttonFlex: {
+    flex: 1,
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
   primaryButton: {
     backgroundColor: '#2563eb',
     borderRadius: 6,

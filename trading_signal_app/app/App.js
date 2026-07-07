@@ -3,6 +3,7 @@ import { StyleSheet, View, Text, StatusBar, ActivityIndicator, Platform, useWind
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from './supabase';
 
 // Import Screens
@@ -23,6 +24,7 @@ const TabIcon = ({ name, color, size }) => {
 };
 
 const Tab = createBottomTabNavigator();
+const TEST_SESSION_KEY = 'gdd_test_login_session';
 
 export default function App() {
   const [session, setSession] = useState(null);
@@ -34,14 +36,26 @@ export default function App() {
 
   useEffect(() => {
     // 1. Get initial session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session) {
+        await AsyncStorage.removeItem(TEST_SESSION_KEY);
+        setSession(session);
+      } else {
+        const storedTestSession = await AsyncStorage.getItem(TEST_SESSION_KEY);
+        setSession(storedTestSession ? JSON.parse(storedTestSession) : null);
+      }
       setInitializing(false);
     });
 
     // 2. Listen for auth changes (login, logout, token refresh)
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session);
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (session) {
+        await AsyncStorage.removeItem(TEST_SESSION_KEY);
+        setSession(session);
+      } else {
+        const storedTestSession = await AsyncStorage.getItem(TEST_SESSION_KEY);
+        setSession(storedTestSession ? JSON.parse(storedTestSession) : null);
+      }
       setInitializing(false);
     });
 
@@ -49,6 +63,17 @@ export default function App() {
       subscription.unsubscribe();
     };
   }, []);
+
+  const handleTestLogin = async (testSession) => {
+    await AsyncStorage.setItem(TEST_SESSION_KEY, JSON.stringify(testSession));
+    setSession(testSession);
+  };
+
+  const handleLogout = async () => {
+    await AsyncStorage.removeItem(TEST_SESSION_KEY);
+    await supabase.auth.signOut();
+    setSession(null);
+  };
 
   if (initializing) {
     return (
@@ -65,7 +90,7 @@ export default function App() {
         <StatusBar barStyle="light-content" backgroundColor="#0a0e17" />
         {!session ? (
           <SafeAreaView style={{ flex: 1, backgroundColor: '#0a0e17' }}>
-            <LoginScreen />
+            <LoginScreen onTestLogin={handleTestLogin} />
           </SafeAreaView>
         ) : (
           <Tab.Navigator
@@ -115,7 +140,7 @@ export default function App() {
               {props => <ConsentScreen {...props} session={session} />}
             </Tab.Screen>
             <Tab.Screen name="Auto-Trade">
-              {props => <SettingsScreen {...props} session={session} onPurge={() => setPurgeTrigger(prev => prev + 1)} />}
+              {props => <SettingsScreen {...props} session={session} onLogout={handleLogout} onPurge={() => setPurgeTrigger(prev => prev + 1)} />}
             </Tab.Screen>
           </Tab.Navigator>
         )}

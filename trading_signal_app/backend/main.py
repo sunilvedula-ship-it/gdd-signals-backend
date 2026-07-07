@@ -4,6 +4,7 @@ import math
 import html
 import secrets
 import asyncio
+import ipaddress
 from urllib.parse import quote
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
@@ -12,9 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+import requests
 
 
-from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState
+from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState, BrokerLiveSetting
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
 from backend.aliceblue_client import (
@@ -91,6 +93,15 @@ class CredentialRequest(BaseModel):
     api_secret: str
     extra: Optional[dict] = None
 
+class TestLoginRequest(BaseModel):
+    phone: str
+    password: str
+
+class BrokerStaticIpRequest(BaseModel):
+    broker_id: str = "aliceblue"
+    static_ip: str
+    registered_with_broker: bool = False
+
 # On startup, initialize DB
 @app.on_event("startup")
 def startup_event():
@@ -123,6 +134,36 @@ def startup_event():
 # Supabase Credentials & Token Validation Helpers
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://lgedxrswafjsvjcoduvw.supabase.co")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxnZWR4cnN3YWZqc3ZqY29kdXZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk1MjczMDYsImV4cCI6MjA5NTEwMzMwNn0.08tMMK4TGbfeLZKHYteqtU2EYR4K5PwAJmgeA-xqrXk")
+
+def normalize_phone_number(value: Optional[str]) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) == 10:
+        digits = f"91{digits}"
+    return f"+{digits}" if digits else ""
+
+def configured_test_login_phones() -> set:
+    raw = os.environ.get("TEST_LOGIN_PHONES", "+919043055445")
+    return {
+        normalize_phone_number(phone)
+        for phone in raw.split(",")
+        if normalize_phone_number(phone)
+    }
+
+def is_test_login_phone(phone: Optional[str]) -> bool:
+    return normalize_phone_number(phone) in configured_test_login_phones()
+
+def get_test_login_payload(token: str) -> Optional[dict]:
+    if not env_flag("TEST_LOGIN_ENABLED", True):
+        return None
+    try:
+        payload = verify_signed_token(token)
+    except (SignedTokenError, RuntimeError, ValueError):
+        return None
+    if payload.get("purpose") != "test_login":
+        return None
+    if not is_test_login_phone(payload.get("phone")):
+        return None
+    return payload
 
 def get_user_from_token(token: str) -> Optional[dict]:
     import urllib.request
@@ -167,6 +208,22 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
 
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    test_payload = get_test_login_payload(token)
+    if test_payload:
+        phone = normalize_phone_number(test_payload.get("phone"))
+        user = db.query(User).filter(User.phone == phone).first()
+        if not user:
+            user = User(
+                email=f"test-{phone.lstrip('+')}@local.gdd",
+                phone=phone,
+                name="Testing User",
+                subscription_status="active",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return user
         
     # Verify token
     user_info = get_user_from_token(token)
@@ -199,6 +256,52 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         db.refresh(user)
         
     return user
+
+@app.post("/api/auth/test-login")
+def test_login(req: TestLoginRequest, db: Session = Depends(get_db)):
+    if not env_flag("TEST_LOGIN_ENABLED", True):
+        raise HTTPException(status_code=403, detail="Test login is not enabled")
+
+    phone = normalize_phone_number(req.phone)
+    expected_password = os.environ.get("TEST_LOGIN_PASSWORD", "123456")
+    if phone not in configured_test_login_phones() or req.password != expected_password:
+        raise HTTPException(status_code=401, detail="Invalid test login")
+
+    try:
+        token = create_signed_token(
+            {
+                "purpose": "test_login",
+                "phone": phone,
+                "test_account": True,
+            },
+            60 * 60 * 24 * 30,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        user = User(
+            email=f"test-{phone.lstrip('+')}@local.gdd",
+            phone=phone,
+            name="Testing User",
+            subscription_status="active",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 60 * 60 * 24 * 30,
+        "user": {
+            "id": user.id,
+            "phone": user.phone,
+            "name": user.name,
+            "test_account": True,
+        },
+    }
 
 def get_base_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
@@ -1948,6 +2051,7 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
     for broker in INDIAN_BROKERS:
         has = mgr.has_credentials(broker['id'])
         masked = mgr.get_masked_info(broker['id']) if has else None
+        live_setting = get_live_setting(db, user.id, broker["id"])
         broker_list.append({
             "id": broker["id"],
             "name": broker["name"],
@@ -1957,6 +2061,8 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
             "available": is_aliceblue_vendor_configured() if broker["id"] == "aliceblue" else True,
             "configured": has,
             "active": active_broker == broker["id"],
+            "static_ip": live_setting.static_ip if live_setting else None,
+            "static_ip_registered": bool(live_setting and live_setting.static_ip_registered),
             "info": masked
         })
     
@@ -2327,6 +2433,139 @@ def resolve_manual_trade(signal: Signal, trade_type: str, lots: float) -> dict:
 
 
 BROKER_FUNDS_CACHE = {}
+BROKER_OUTBOUND_IP_CACHE = {"value": None, "checked_at": None}
+SUPPORTED_LIVE_BROKERS = {"aliceblue": "Alice Blue"}
+
+
+def _broker_proxy_url() -> Optional[str]:
+    return (
+        os.environ.get("BROKER_PROXY_URL")
+        or os.environ.get("PROXY_URL")
+        or os.environ.get("QUOTAGUARDSTATIC_URL")
+        or os.environ.get("FIXIE_URL")
+    )
+
+
+def validate_public_static_ip(value: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Enter a valid static IP address") from exc
+    if parsed.version != 4:
+        raise HTTPException(status_code=400, detail="Broker static IP registration currently expects an IPv4 address")
+    if not parsed.is_global:
+        raise HTTPException(status_code=400, detail="Enter a public static IPv4 address, not a private/local IP")
+    return str(parsed)
+
+
+def get_backend_outbound_ip(force_refresh: bool = False) -> Optional[str]:
+    configured = os.environ.get("BROKER_STATIC_OUTBOUND_IP", "").strip()
+    if configured:
+        try:
+            return validate_public_static_ip(configured)
+        except HTTPException:
+            return None
+
+    now = datetime.utcnow()
+    cached_at = BROKER_OUTBOUND_IP_CACHE.get("checked_at")
+    if (
+        not force_refresh
+        and BROKER_OUTBOUND_IP_CACHE.get("value")
+        and cached_at
+        and (now - cached_at).total_seconds() < 300
+    ):
+        return BROKER_OUTBOUND_IP_CACHE["value"]
+
+    proxy = _broker_proxy_url()
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        response = requests.get("https://api.ipify.org?format=json", timeout=5, proxies=proxies)
+        response.raise_for_status()
+        ip_value = validate_public_static_ip(response.json().get("ip", ""))
+    except Exception as exc:
+        print(f"[Live Readiness] Could not detect backend outbound IP: {exc}")
+        ip_value = None
+
+    BROKER_OUTBOUND_IP_CACHE["value"] = ip_value
+    BROKER_OUTBOUND_IP_CACHE["checked_at"] = now
+    return ip_value
+
+
+def get_live_setting(db: Session, user_id: int, broker_id: str) -> Optional[BrokerLiveSetting]:
+    return db.query(BrokerLiveSetting).filter(
+        BrokerLiveSetting.user_id == user_id,
+        BrokerLiveSetting.broker_id == broker_id,
+    ).first()
+
+
+def build_live_readiness(user: User, db: Session, broker_id: str = "aliceblue", force_ip_refresh: bool = False) -> dict:
+    broker_id = (broker_id or "aliceblue").lower().strip()
+    mgr = AppCredentialsManager(db, user_id=user.id)
+    active_id = mgr.get_active_broker()
+    setting = get_live_setting(db, user.id, broker_id)
+    static_ip = setting.static_ip if setting else None
+    static_registered = bool(setting and setting.static_ip_registered)
+    outbound_ip = get_backend_outbound_ip(force_refresh=force_ip_refresh)
+    static_ip_check_required = env_flag("LIVE_STATIC_IP_CHECK_REQUIRED", True)
+    static_ip_matches = bool(static_ip and outbound_ip and static_ip == outbound_ip)
+    credentials_connected = bool(mgr.has_credentials(broker_id))
+    vendor_configured = is_aliceblue_vendor_configured() if broker_id == "aliceblue" else False
+    server_live_enabled = env_flag("LIVE_TRADING_ENABLED")
+    test_account_blocked = is_test_login_phone(user.phone) and not env_flag("ALLOW_TEST_LOGIN_LIVE_TRADING")
+
+    blockers = []
+    if broker_id not in SUPPORTED_LIVE_BROKERS:
+        blockers.append("This broker is not wired for live execution yet")
+    if not server_live_enabled:
+        blockers.append("Server live trading switch is off")
+    if not vendor_configured:
+        blockers.append("Alice Blue Vendor API is not configured on the server")
+    if not credentials_connected or active_id != broker_id:
+        blockers.append("Connect Alice Blue before placing live orders")
+    if not static_ip:
+        blockers.append("Add the broker/exchange-approved static IP")
+    if static_ip and not static_registered:
+        blockers.append("Confirm that the static IP is registered with the broker/exchange")
+    if static_ip_check_required and static_ip and outbound_ip and not static_ip_matches:
+        blockers.append("Backend outbound IP does not match the registered static IP")
+    if static_ip_check_required and static_ip and not outbound_ip:
+        blockers.append("Backend outbound IP could not be verified")
+    if test_account_blocked:
+        blockers.append("The shared testing login is paper-only")
+
+    live_enabled = (
+        not blockers
+        and broker_id in SUPPORTED_LIVE_BROKERS
+        and server_live_enabled
+        and vendor_configured
+        and credentials_connected
+        and active_id == broker_id
+    )
+
+    return {
+        "broker_id": broker_id,
+        "broker_name": SUPPORTED_LIVE_BROKERS.get(broker_id, broker_id.title()),
+        "active_broker_id": active_id,
+        "server_live_enabled": server_live_enabled,
+        "vendor_configured": vendor_configured,
+        "credentials_connected": credentials_connected,
+        "static_ip": static_ip,
+        "static_ip_registered": static_registered,
+        "backend_outbound_ip": outbound_ip,
+        "static_ip_check_required": static_ip_check_required,
+        "static_ip_matches": static_ip_matches,
+        "live_enabled": live_enabled,
+        "blockers": blockers,
+    }
+
+
+def require_live_trading_ready(user: User, db: Session, broker_id: str = "aliceblue") -> dict:
+    readiness = build_live_readiness(user, db, broker_id)
+    if not readiness["live_enabled"]:
+        detail = readiness["blockers"][0] if readiness["blockers"] else "Live trading is not ready"
+        raise HTTPException(status_code=503, detail=detail)
+    return readiness
 
 
 def get_cached_broker_balance(user_id: int, broker_id: str, db: Session) -> Optional[float]:
@@ -2343,6 +2582,46 @@ def get_cached_broker_balance(user_id: int, broker_id: str, db: Session) -> Opti
             balance = None
     BROKER_FUNDS_CACHE[cache_key] = (balance, now)
     return balance
+
+
+@app.get("/api/broker/live-readiness")
+def get_broker_live_readiness(
+    broker_id: str = Query("aliceblue"),
+    refresh_ip: bool = Query(False),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return build_live_readiness(user, db, broker_id, force_ip_refresh=refresh_ip)
+
+
+@app.post("/api/broker/static-ip")
+def save_broker_static_ip(
+    req: BrokerStaticIpRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    broker_id = req.broker_id.lower().strip()
+    supported = {broker["id"] for broker in INDIAN_BROKERS}
+    if broker_id not in supported:
+        raise HTTPException(status_code=400, detail="Unsupported broker")
+
+    static_ip = validate_public_static_ip(req.static_ip)
+    setting = get_live_setting(db, user.id, broker_id)
+    if setting:
+        setting.static_ip = static_ip
+        setting.static_ip_registered = bool(req.registered_with_broker)
+        setting.updated_at = get_ist_time()
+    else:
+        setting = BrokerLiveSetting(
+            user_id=user.id,
+            broker_id=broker_id,
+            static_ip=static_ip,
+            static_ip_registered=bool(req.registered_with_broker),
+            updated_at=get_ist_time(),
+        )
+        db.add(setting)
+    db.commit()
+    return build_live_readiness(user, db, broker_id, force_ip_refresh=True)
 
 @app.get("/api/broker/status")
 def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -2367,8 +2646,9 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
             
     if active_id:
         masked = mgr.get_masked_info(active_id)
-        live_enabled = env_flag("LIVE_TRADING_ENABLED") and active_id == "aliceblue"
-        balance = get_cached_broker_balance(user.id, active_id, db)
+        readiness = build_live_readiness(user, db, active_id) if active_id == "aliceblue" else None
+        live_enabled = bool(readiness and readiness["live_enabled"])
+        balance = get_cached_broker_balance(user.id, active_id, db) if live_enabled else None
         return {
             "status": "linked",
             "broker_id": active_id,
@@ -2377,6 +2657,7 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
             "balance_available": balance is not None,
             "mode": "LIVE" if live_enabled else "LINKED",
             "live_enabled": live_enabled,
+            "live_readiness": readiness,
             "combined_open_pnl": round(combined_pnl, 2)
         }
     else:
@@ -2413,16 +2694,11 @@ def preview_broker_order(
 ):
     if req.mode.upper() != "LIVE":
         raise HTTPException(status_code=400, detail="Order preview is only required for live orders")
-    if not env_flag("LIVE_TRADING_ENABLED"):
-        raise HTTPException(status_code=503, detail="Live trading is not enabled on the server")
+    require_live_trading_ready(user, db, "aliceblue")
     max_live_lots = max(1, int(os.environ.get("MAX_LIVE_LOTS_PER_ORDER", "10")))
     if req.lots > max_live_lots:
         raise HTTPException(status_code=400, detail=f"Live orders are limited to {max_live_lots} lots")
     require_daily_live_consent(user.id, db)
-
-    manager = AppCredentialsManager(db, user_id=user.id)
-    if manager.get_active_broker() != "aliceblue":
-        raise HTTPException(status_code=400, detail="Connect Alice Blue before previewing a live order")
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
@@ -2495,8 +2771,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     prepared_live_order = None
     active_broker = None
     if mode == "LIVE":
-        if not env_flag("LIVE_TRADING_ENABLED"):
-            raise HTTPException(status_code=503, detail="Live trading is not enabled on the server")
+        require_live_trading_ready(user, db, "aliceblue")
         require_daily_live_consent(user.id, db)
         mgr = AppCredentialsManager(db, user_id=user.id)
         active_broker = mgr.get_active_broker()
@@ -2738,7 +3013,7 @@ def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User
     inspector = inspect(db.bind)
     
     tables_schema = {}
-    for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials"]:
+    for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials", "broker_live_settings"]:
         columns = [{"name": col["name"], "type": str(col["type"])} for col in inspector.get_columns(table_name)]
         tables_schema[table_name] = columns
         

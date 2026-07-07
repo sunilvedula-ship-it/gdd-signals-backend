@@ -18,7 +18,7 @@ os.environ.pop("WEBHOOK_AUTO_EXECUTION_MODE", None)
 from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
-from backend.database import BrokerOrder, Position, SessionLocal, Signal, engine, init_db
+from backend.database import BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
 from backend.main import app, square_off_expired_intraday_positions
 
 
@@ -153,6 +153,25 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 503, response.text)
 
+    def test_configured_test_phone_can_login_with_common_password(self):
+        with patch.dict(os.environ, {"BROKER_AUTH_STATE_SECRET": "integration-signing-key"}, clear=False):
+            response = self.client.post(
+                "/api/auth/test-login",
+                json={"phone": "+91 9043055445", "password": "123456"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["access_token"])
+        db = SessionLocal()
+        try:
+            db.query(Position).filter(Position.user_id != 1).delete()
+            test_user = db.query(User).filter(User.phone == "+919043055445").first()
+            if test_user:
+                db.delete(test_user)
+            db.commit()
+        finally:
+            db.close()
+
     def test_aliceblue_live_preview_and_submission_are_audited(self):
         db = SessionLocal()
         try:
@@ -193,8 +212,11 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
 
         environment = {
             "LIVE_TRADING_ENABLED": "true",
+            "LIVE_STATIC_IP_CHECK_REQUIRED": "false",
             "CREDENTIAL_ENCRYPTION_KEY": "integration-encryption-key",
             "BROKER_AUTH_STATE_SECRET": "integration-signing-key",
+            "ALICEBLUE_APP_CODE": "integration-app-code",
+            "ALICEBLUE_API_SECRET": "integration-api-secret",
         }
         with patch.dict(os.environ, environment, clear=False):
             db = SessionLocal()
@@ -204,6 +226,13 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                     "AB12345",
                     "alice-session-token",
                 )
+                db.add(BrokerLiveSetting(
+                    user_id=1,
+                    broker_id="aliceblue",
+                    static_ip="8.8.8.8",
+                    static_ip_registered=True,
+                ))
+                db.commit()
             finally:
                 db.close()
 

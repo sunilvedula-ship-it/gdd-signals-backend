@@ -189,7 +189,10 @@ export default function FeedScreen({ session, purgeTrigger }) {
       return;
     }
     if (!brokerStatus.live_enabled) {
-      Alert.alert('Live trading unavailable', 'Connect an approved Alice Blue account before placing live orders.');
+      Alert.alert(
+        'Live trading unavailable',
+        brokerStatus.live_readiness?.blockers?.[0] || 'Complete live readiness in the Auto-Trade tab before placing live orders.'
+      );
       return;
     }
     if (!consentSigned) {

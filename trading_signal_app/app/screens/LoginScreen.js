@@ -1,8 +1,14 @@
 import React, { useState } from 'react';
 import { StyleSheet, View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, Image, useWindowDimensions } from 'react-native';
+import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
-export default function LoginScreen() {
+const TEST_LOGIN_PHONE = '919043055445';
+const TEST_LOGIN_PASSWORD = '123456';
+
+const cleanPhone = (value) => value.trim().replace(/[\s+-]/g, '');
+
+export default function LoginScreen({ onTestLogin }) {
   const [phone, setPhone] = useState('');
   const [otp, setOtp] = useState('');
   const [otpSent, setOtpSent] = useState(false);
@@ -19,7 +25,13 @@ export default function LoginScreen() {
     }
     
     // Clean phone number (strip whitespace or dashes, make sure it starts with country code)
-    let cleanedPhone = phone.trim().replace(/[\s-+]/g, '');
+    let cleanedPhone = cleanPhone(phone);
+    if (cleanedPhone.length === 10) cleanedPhone = `91${cleanedPhone}`;
+    if (cleanedPhone === TEST_LOGIN_PHONE) {
+      setOtpSent(true);
+      Alert.alert("Testing Login", "Use 123456 as the 6-digit testing password.");
+      return;
+    }
     
     setLoading(true);
     // Send OTP request to Supabase Auth
@@ -43,7 +55,42 @@ export default function LoginScreen() {
       return;
     }
     
-    let cleanedPhone = phone.trim().replace(/[\s-+]/g, '');
+    let cleanedPhone = cleanPhone(phone);
+    if (cleanedPhone.length === 10) cleanedPhone = `91${cleanedPhone}`;
+
+    if (cleanedPhone === TEST_LOGIN_PHONE && otp.trim() !== TEST_LOGIN_PASSWORD) {
+      Alert.alert("Invalid Password", "Use 123456 for the testing number.");
+      return;
+    }
+
+    if (cleanedPhone === TEST_LOGIN_PHONE) {
+      setLoading(true);
+      try {
+        const response = await fetch(`${BACKEND_URL}/api/auth/test-login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone: `+${cleanedPhone}`, password: otp.trim() }),
+        });
+        const text = await response.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = null; }
+        if (!response.ok || !data?.access_token) {
+          Alert.alert("Testing Login Failed", data?.detail || "Could not sign in with the testing password.");
+          return;
+        }
+        onTestLogin({
+          access_token: data.access_token,
+          token_type: data.token_type || 'bearer',
+          user: data.user,
+          is_test_session: true,
+        });
+      } catch (error) {
+        Alert.alert("Network error", error.message);
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
 
     setLoading(true);
     const { error } = await supabase.auth.verifyOtp({
@@ -123,7 +170,7 @@ export default function LoginScreen() {
                 autoFocus
               />
               <Text style={styles.infoText}>
-                Code sent to +{phone.trim().replace(/[\s-+]/g, '')}. Please enter it above.
+                Code sent to +{cleanPhone(phone)}. Please enter it above.
               </Text>
               
               <TouchableOpacity 

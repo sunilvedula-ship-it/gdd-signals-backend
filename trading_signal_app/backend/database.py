@@ -113,6 +113,20 @@ class BrokerCredential(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class BrokerLiveSetting(Base):
+    __tablename__ = 'broker_live_settings'
+    __table_args__ = (
+        UniqueConstraint('user_id', 'broker_id', name='uq_broker_live_setting_user_broker'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), default=1, index=True)
+    broker_id = Column(String, index=True)
+    static_ip = Column(String, nullable=True)
+    static_ip_registered = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class BrokerOrder(Base):
     __tablename__ = 'broker_orders'
     __table_args__ = (
