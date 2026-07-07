@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
 from backend.database import AppAuthSession, BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
-from backend.main import app, square_off_expired_intraday_positions
+from backend.main import app, get_ist_time, square_off_expired_intraday_positions
 
 
 class BankNiftyWebhookIntegrationTests(unittest.TestCase):
@@ -277,6 +277,99 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
             order = db.query(BrokerOrder).filter(BrokerOrder.signal_id == signal_id).one()
             self.assertEqual(position.status, "PENDING")
             self.assertEqual(position.entry_broker_order_id, "260706000000001")
+            self.assertEqual(order.status, "SUBMITTED")
+            self.assertEqual(order.position_id, position.id)
+        finally:
+            db.close()
+
+    def test_flattrade_live_preview_and_submission_are_audited(self):
+        db = SessionLocal()
+        try:
+            signal = Signal(
+                symbol="NIFTY",
+                action="LONG",
+                price=24414,
+                source="TradingView",
+                source_name="flattrade-live-test",
+                raw_payload="{}",
+                timeframe="5m",
+                trade_type="POSITIONAL",
+            )
+            db.add(signal)
+            db.commit()
+            signal_id = signal.id
+        finally:
+            db.close()
+
+        today_str = get_ist_time().date().isoformat()
+        environment = {
+            "LIVE_TRADING_ENABLED": "true",
+            "LIVE_STATIC_IP_CHECK_REQUIRED": "false",
+            "CREDENTIAL_ENCRYPTION_KEY": "integration-encryption-key",
+            "BROKER_AUTH_STATE_SECRET": "integration-signing-key",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            db = SessionLocal()
+            try:
+                AppCredentialsManager(db, user_id=1).save_credentials(
+                    "flattrade",
+                    "FTAPIKEY",
+                    "FTSECRET",
+                    extra={
+                        "client_id": "FT12345",
+                        "token": "flattrade-session-token",
+                        "token_date": today_str,
+                    },
+                )
+                db.add(BrokerLiveSetting(
+                    user_id=1,
+                    broker_id="flattrade",
+                    static_ip="8.8.4.4",
+                    static_ip_registered=True,
+                ))
+                db.commit()
+            finally:
+                db.close()
+
+            with patch("backend.main.get_live_market_price", return_value=24414.0):
+                preview_response = self.client.post(
+                    "/api/broker/order-preview",
+                    json={"signal_id": signal_id, "trade_type": "FUTURE", "mode": "LIVE", "lots": 1},
+                )
+            self.assertEqual(preview_response.status_code, 200, preview_response.text)
+            preview = preview_response.json()
+            self.assertEqual(preview["broker_name"], "Flattrade")
+            preview_token = preview["preview_token"]
+
+            broker_result = {
+                "status": "success",
+                "broker_order_id": "FT260707000001",
+                "broker_response": {"stat": "Ok"},
+            }
+            with patch("backend.main.get_live_market_price", return_value=24414.0), patch(
+                "backend.main.place_flattrade_prepared_order", return_value=broker_result
+            ):
+                execute_response = self.client.post(
+                    "/api/broker/execute",
+                    json={
+                        "signal_id": signal_id,
+                        "trade_type": "FUTURE",
+                        "mode": "LIVE",
+                        "lots": 1,
+                        "preview_token": preview_token,
+                        "idempotency_key": "flattrade-live-test-order",
+                    },
+                )
+
+        self.assertEqual(execute_response.status_code, 200, execute_response.text)
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(Position.signal_id == signal_id).one()
+            order = db.query(BrokerOrder).filter(BrokerOrder.signal_id == signal_id).one()
+            self.assertEqual(position.status, "PENDING")
+            self.assertEqual(position.broker_id, "flattrade")
+            self.assertEqual(position.entry_broker_order_id, "FT260707000001")
+            self.assertEqual(order.broker_id, "flattrade")
             self.assertEqual(order.status, "SUBMITTED")
             self.assertEqual(order.position_id, position.id)
         finally:

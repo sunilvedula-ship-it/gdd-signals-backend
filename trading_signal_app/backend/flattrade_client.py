@@ -10,13 +10,26 @@ from sqlalchemy.orm import Session
 TOKEN_URL = "https://authapi.flattrade.in/trade/apitoken"
 PLACE_ORDER_URL = "https://piconnect.flattrade.in/PiConnectAPI/PlaceOrder"
 
+
+class FlattradeError(RuntimeError):
+    pass
+
+
+def _proxy_url() -> Optional[str]:
+    return (
+        os.environ.get("BROKER_PROXY_URL")
+        or os.environ.get("PROXY_URL")
+        or os.environ.get("QUOTAGUARDSTATIC_URL")
+        or os.environ.get("FIXIE_URL")
+    )
+
 def send_api_request(url: str, data_dict: dict) -> tuple[int, str]:
     """Helper to send POST request, optionally routing through a proxy if configured."""
     headers = {"Content-Type": "application/json"}
     data_bytes = json.dumps(data_dict).encode("utf-8")
     req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
     
-    proxy_url = os.environ.get("PROXY_URL") or os.environ.get("QUOTAGUARDSTATIC_URL") or os.environ.get("FIXIE_URL")
+    proxy_url = _proxy_url()
     if proxy_url:
         proxy_handler = urllib.request.ProxyHandler({'http': proxy_url, 'https': proxy_url})
         opener = urllib.request.build_opener(proxy_handler)
@@ -143,80 +156,147 @@ def map_to_flattrade_symbol(symbol_str: str) -> str:
     
     return f"{underlying}{expiry_str}F"
 
-def place_flattrade_order(user_id: int, symbol: str, direction: str, qty: float, price: float, db: Session, trade_type: str = "INTRADAY") -> Dict[str, Any]:
-    """Places a live Limit order with Flattrade REST API."""
-    from backend.credentials import AppCredentialsManager
-    mgr = AppCredentialsManager(db, user_id=user_id)
-    
-    # Load credentials
-    creds = mgr.load_credentials("flattrade")
-    if not creds:
-        return {"status": "error", "message": "Flattrade credentials not configured."}
-        
-    client_id = creds.get("extra", {}).get("client_id")
-    api_key = creds.get("api_key")
-    session_token = creds.get("extra", {}).get("token")
-    token_date = creds.get("extra", {}).get("token_date")
-    
-    if not client_id or not api_key or not session_token:
-        return {"status": "error", "message": "Live session not authorized. Please log in to Flattrade."}
-        
-    # Verify token is from today
-    today_str = get_ist_time().date().isoformat()
-    if token_date != today_str:
-        return {"status": "error", "message": "Live session expired. Please re-authorize today's session."}
-        
-    # Resolve exchange, transaction type and product
+
+def prepare_order(
+    symbol: str,
+    direction: str,
+    lots: float,
+    price: float,
+    trade_type: str,
+    quantity: Optional[int] = None,
+) -> Dict[str, Any]:
+    if lots <= 0 or int(lots) != lots:
+        raise FlattradeError("Lots must be a positive whole number")
+    qty = int(quantity if quantity is not None else lots)
+    if qty <= 0:
+        raise FlattradeError("Order quantity must be positive")
+
     parts = symbol.split()
     is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
-    is_future = "1!" in symbol or "FUT" in symbol or symbol in ["NIFTY", "BANKNIFTY", "SENSEX"]
-    
-    exch = "NFO" if (is_option or is_future) else "NSE"
-    trantype = "B" if direction.upper() in ["BUY", "LONG"] else "S"
-    
-    # Product type: MIS (M) for intraday, NRML (H) for positional options/futures, CNC (C) for stocks
-    if exch == "NFO":
-        prd = "M" if trade_type.upper() == "INTRADAY" else "H"
-    else:
-        prd = "M" if trade_type.upper() == "INTRADAY" else "C"
-        
-    tsym = map_to_flattrade_symbol(symbol)
-    
-    # Construct Flattrade order JSON payload
+    normalized = symbol.upper().strip()
+    underlying = parts[0].upper() if parts else normalized
+    is_future = (
+        "1!" in normalized
+        or "FUT" in normalized
+        or normalized in ["NIFTY", "BANKNIFTY", "SENSEX"]
+    )
+    exch = ("BFO" if ("SENSEX" in underlying or "BSX" in underlying) else "NFO") if (is_option or is_future) else "NSE"
+    transaction_type = "B" if direction.upper() in ["BUY", "LONG"] else "S"
+    product = ("M" if trade_type.upper() == "INTRADAY" else "H") if exch == "NFO" else (
+        "M" if trade_type.upper() == "INTRADAY" else "C"
+    )
+    trading_symbol = map_to_flattrade_symbol(symbol)
+    return {
+        "broker_id": "flattrade",
+        "broker_name": "Flattrade",
+        "symbol": symbol,
+        "trading_symbol": trading_symbol,
+        "instrument_id": trading_symbol,
+        "exchange": exch,
+        "transaction_type": transaction_type,
+        "quantity": qty,
+        "lot_size": int(qty / lots) if lots else qty,
+        "lots": int(lots),
+        "product": product,
+        "order_type": "LIMIT",
+        "validity": "DAY",
+        "limit_price": round(float(price), 2),
+    }
+
+
+def _load_user_session(user_id: int, db: Session) -> Dict[str, str]:
+    from backend.credentials import AppCredentialsManager
+
+    mgr = AppCredentialsManager(db, user_id=user_id)
+    creds = mgr.load_credentials("flattrade")
+    if not creds:
+        raise FlattradeError("Flattrade credentials are not configured")
+
+    extra = creds.get("extra", {}) or {}
+    client_id = extra.get("client_id")
+    session_token = extra.get("token")
+    token_date = extra.get("token_date")
+    today_str = get_ist_time().date().isoformat()
+
+    if not client_id or not creds.get("api_key"):
+        raise FlattradeError("Flattrade Client ID and API Key are required")
+    if not session_token:
+        raise FlattradeError("Authorize today's Flattrade session before placing live orders")
+    if token_date != today_str:
+        raise FlattradeError("Flattrade live session expired. Re-authorize today's session")
+
+    return {
+        "client_id": client_id,
+        "api_key": creds.get("api_key"),
+        "session_token": session_token,
+    }
+
+
+def place_order(user_id: int, db: Session, prepared: Dict[str, Any], order_tag: str = "") -> Dict[str, Any]:
+    session = _load_user_session(user_id, db)
+    client_id = session["client_id"]
     jData = {
         "uid": client_id,
         "actid": client_id,
-        "exch": exch,
-        "tsym": tsym,
-        "qty": str(int(qty)),
-        "trantype": trantype,
+        "exch": prepared["exchange"],
+        "tsym": prepared["trading_symbol"],
+        "qty": str(int(prepared["quantity"])),
+        "trantype": prepared["transaction_type"],
         "prctyp": "LMT",
-        "prd": prd,
+        "prd": prepared["product"],
         "ret": "DAY",
         "trgprc": "0",
-        "prc": f"{price:.2f}"
+        "prc": f"{float(prepared['limit_price']):.2f}",
     }
-    
+    if order_tag:
+        jData["remarks"] = order_tag[:50]
+
     payload = {
         "jData": json.dumps(jData),
-        "jKey": session_token
+        "jKey": session["session_token"],
     }
-    
+
     try:
         response_code, response_body = send_api_request(PLACE_ORDER_URL, payload)
-        if response_code == 200:
-            data = json.loads(response_body)
-            if data.get("stat") == "Ok":
-                return {
-                    "status": "success",
-                    "order_id": data.get("norenordno"),
-                    "symbol": tsym,
-                    "qty": qty,
-                    "price": price
-                }
-            else:
-                return {"status": "error", "message": data.get("emsg", "Flattrade returned failure status")}
-        else:
-            return {"status": "error", "message": f"HTTP status code {response_code}"}
+        data = json.loads(response_body)
+    except Exception as exc:
+        raise FlattradeError(f"Flattrade request failed: {exc}") from exc
+
+    if response_code != 200:
+        raise FlattradeError(f"HTTP status code {response_code}: {response_body}")
+    if data.get("stat") != "Ok":
+        raise FlattradeError(data.get("emsg") or "Flattrade rejected the order")
+
+    broker_order_id = data.get("norenordno")
+    if not broker_order_id:
+        raise FlattradeError("Flattrade did not return an order number")
+
+    return {
+        "status": "success",
+        "broker_order_id": str(broker_order_id),
+        "prepared": prepared,
+        "broker_response": data,
+    }
+
+def place_flattrade_order(user_id: int, symbol: str, direction: str, qty: float, price: float, db: Session, trade_type: str = "INTRADAY") -> Dict[str, Any]:
+    """Places a live Limit order with Flattrade REST API."""
+    try:
+        prepared = prepare_order(
+            symbol=symbol,
+            direction=direction,
+            lots=1,
+            quantity=int(qty),
+            price=price,
+            trade_type=trade_type,
+        )
+        result = place_order(user_id, db, prepared, order_tag=f"GDD-{symbol}"[:50])
+        return {
+            "status": "success",
+            "order_id": result["broker_order_id"],
+            "symbol": prepared["trading_symbol"],
+            "qty": qty,
+            "price": price,
+            "broker_response": result.get("broker_response", {}),
+        }
     except Exception as e:
         return {"status": "error", "message": f"Network / API connection error: {e}"}

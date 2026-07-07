@@ -21,10 +21,16 @@ import { supabase } from '../supabase';
 export default function SettingsScreen({ session, onLogout, onPurge }) {
   const [brokers, setBrokers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [selectedBrokerId, setSelectedBrokerId] = useState('aliceblue');
+  const [savingBroker, setSavingBroker] = useState(false);
+  const [authorizingBroker, setAuthorizingBroker] = useState(false);
   const [savingStaticIp, setSavingStaticIp] = useState(false);
   const [liveReadiness, setLiveReadiness] = useState(null);
   const [staticIp, setStaticIp] = useState('');
   const [staticIpRegistered, setStaticIpRegistered] = useState(false);
+  const [flattradeClientId, setFlattradeClientId] = useState('');
+  const [flattradeApiKey, setFlattradeApiKey] = useState('');
+  const [flattradeApiSecret, setFlattradeApiSecret] = useState('');
   const { width, height } = useWindowDimensions();
   const isLandscape = width > height;
 
@@ -47,7 +53,7 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
       if (response.ok && data) {
         setBrokers(data.brokers || []);
       }
-      await fetchLiveReadiness(false);
+      await fetchLiveReadiness(selectedBrokerId, false);
     } catch (error) {
       console.warn('Error loading broker connection:', error.message);
     } finally {
@@ -55,8 +61,8 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
     }
   };
 
-  const fetchLiveReadiness = async (refreshIp = false) => {
-    const response = await fetch(`${BACKEND_URL}/api/broker/live-readiness?broker_id=aliceblue&refresh_ip=${refreshIp ? 'true' : 'false'}`, {
+  const fetchLiveReadiness = async (brokerId = selectedBrokerId, refreshIp = false) => {
+    const response = await fetch(`${BACKEND_URL}/api/broker/live-readiness?broker_id=${brokerId}&refresh_ip=${refreshIp ? 'true' : 'false'}`, {
       headers: authHeaders(),
     });
     const text = await response.text();
@@ -77,6 +83,10 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
     });
     return () => subscription.remove();
   }, [session?.access_token]);
+
+  useEffect(() => {
+    fetchLiveReadiness(selectedBrokerId, false);
+  }, [selectedBrokerId]);
 
   const connectAliceBlue = async () => {
     setLoading(true);
@@ -101,8 +111,12 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
   };
 
   const disconnectAliceBlue = () => {
+    disconnectBroker('aliceblue', 'Alice Blue');
+  };
+
+  const disconnectBroker = (brokerId, brokerName) => {
     Alert.alert(
-      'Disconnect Alice Blue',
+      `Disconnect ${brokerName}`,
       'Live orders will remain unavailable until the broker account is connected again.',
       [
         { text: 'Cancel', style: 'cancel' },
@@ -112,7 +126,7 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
           onPress: async () => {
             setLoading(true);
             try {
-              await fetch(`${BACKEND_URL}/api/credentials/aliceblue`, {
+              await fetch(`${BACKEND_URL}/api/credentials/${brokerId}`, {
                 method: 'DELETE',
                 headers: authHeaders(),
               });
@@ -128,6 +142,63 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
     );
   };
 
+  const saveFlattradeCredentials = async () => {
+    if (!flattradeClientId.trim() || !flattradeApiKey.trim() || !flattradeApiSecret.trim()) {
+      Alert.alert('Flattrade details required', 'Enter Client ID, API Key and API Secret.');
+      return;
+    }
+    setSavingBroker(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/credentials`, {
+        method: 'POST',
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          broker_id: 'flattrade',
+          api_key: flattradeApiKey.trim(),
+          api_secret: flattradeApiSecret.trim(),
+          extra: { client_id: flattradeClientId.trim() },
+        }),
+      });
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (!response.ok) {
+        Alert.alert('Credentials not saved', data?.detail || 'Could not save Flattrade credentials.');
+        return;
+      }
+      setSelectedBrokerId('flattrade');
+      setFlattradeApiSecret('');
+      await fetchCredentials();
+      Alert.alert('Flattrade saved', 'Authorize today\'s Flattrade session before placing live orders.');
+    } catch (error) {
+      Alert.alert('Network error', error.message);
+    } finally {
+      setSavingBroker(false);
+    }
+  };
+
+  const authorizeFlattrade = async () => {
+    setAuthorizingBroker(true);
+    try {
+      const response = await fetch(`${BACKEND_URL}/api/broker/flattrade/login-url`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      const text = await response.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+      if (!response.ok || !data?.login_url) {
+        Alert.alert('Authorization unavailable', data?.detail || 'Flattrade authorization could not be started.');
+        return;
+      }
+      await Linking.openURL(data.login_url);
+    } catch (error) {
+      Alert.alert('Network error', error.message);
+    } finally {
+      setAuthorizingBroker(false);
+    }
+  };
+
   const saveStaticIp = async () => {
     if (!staticIp.trim()) {
       Alert.alert('Static IP required', 'Enter the approved public static IP.');
@@ -139,7 +210,7 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
         method: 'POST',
         headers: authHeaders(true),
         body: JSON.stringify({
-          broker_id: 'aliceblue',
+          broker_id: selectedBrokerId,
           static_ip: staticIp.trim(),
           registered_with_broker: staticIpRegistered,
         }),
@@ -205,6 +276,9 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
   }
 
   const aliceBlue = brokers.find(broker => broker.id === 'aliceblue');
+  const flattrade = brokers.find(broker => broker.id === 'flattrade');
+  const selectedBroker = brokers.find(broker => broker.id === selectedBrokerId);
+  const selectedBrokerName = selectedBroker?.name || (selectedBrokerId === 'flattrade' ? 'Flattrade' : 'Alice Blue');
 
   return (
     <ScrollView
@@ -212,37 +286,114 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
       contentContainerStyle={[styles.content, isLandscape && styles.contentLandscape]}
     >
       <Text style={styles.sectionTitle}>Broker Account</Text>
-      <View style={styles.card}>
-        <View style={styles.rowBetween}>
-          <View style={styles.rowText}>
-            <Text style={styles.cardTitle}>Alice Blue</Text>
-            <Text style={styles.cardText}>Vendor API execution account</Text>
-          </View>
-          <TouchableOpacity style={styles.outlineButton} onPress={() => Linking.openURL('https://aliceblueonline.com/')}>
-            <Text style={styles.outlineButtonText}>OPEN</Text>
+      <View style={styles.brokerGrid}>
+        {[
+          ['aliceblue', 'Alice Blue', 'Vendor API execution account', aliceBlue?.configured],
+          ['flattrade', 'Flattrade', 'Pi API static-IP account', flattrade?.configured],
+        ].map(([id, name, detail, configured]) => (
+          <TouchableOpacity
+            key={id}
+            style={[styles.brokerCard, selectedBrokerId === id && styles.brokerCardSelected]}
+            onPress={() => setSelectedBrokerId(id)}
+          >
+            <View style={styles.rowBetween}>
+              <View style={styles.rowText}>
+                <Text style={styles.cardTitle}>{name}</Text>
+                <Text style={styles.cardText}>{detail}</Text>
+              </View>
+              <View style={[styles.statusPill, configured ? styles.statusPillConnected : styles.statusPillMuted]}>
+                <Text style={styles.statusPillText}>{configured ? 'SAVED' : 'SETUP'}</Text>
+              </View>
+            </View>
           </TouchableOpacity>
-        </View>
+        ))}
       </View>
 
       <Text style={styles.sectionTitle}>Broker Connection</Text>
       <View style={styles.card}>
-        {aliceBlue?.configured ? (
-          <>
-            <View style={styles.statusRow}>
-              <View style={styles.statusDot} />
-              <View>
-                <Text style={styles.connectedTitle}>Alice Blue connected</Text>
-                <Text style={styles.cardText}>Account authorized through secure broker login</Text>
+        {selectedBrokerId === 'aliceblue' ? (
+          aliceBlue?.configured ? (
+            <>
+              <View style={styles.statusRow}>
+                <View style={styles.statusDot} />
+                <View>
+                  <Text style={styles.connectedTitle}>Alice Blue connected</Text>
+                  <Text style={styles.cardText}>Account authorized through secure broker login</Text>
+                </View>
               </View>
-            </View>
-            <TouchableOpacity style={styles.dangerButton} onPress={disconnectAliceBlue}>
-              <Text style={styles.dangerButtonText}>DISCONNECT</Text>
+              <TouchableOpacity style={styles.dangerButton} onPress={disconnectAliceBlue}>
+                <Text style={styles.dangerButtonText}>DISCONNECT</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <TouchableOpacity style={styles.primaryButton} onPress={connectAliceBlue}>
+              <Text style={styles.primaryButtonText}>CONNECT ALICE BLUE</Text>
             </TouchableOpacity>
-          </>
+          )
         ) : (
-          <TouchableOpacity style={styles.primaryButton} onPress={connectAliceBlue}>
-            <Text style={styles.primaryButtonText}>CONNECT ALICE BLUE</Text>
-          </TouchableOpacity>
+          <>
+            {flattrade?.configured ? (
+              <View style={styles.statusRow}>
+                <View style={styles.statusDot} />
+                <View style={styles.statusTextWrap}>
+                  <Text style={styles.connectedTitle}>Flattrade credentials saved</Text>
+                  <Text style={styles.cardText}>Authorize a fresh Flattrade session each trading day</Text>
+                </View>
+              </View>
+            ) : null}
+
+            <Text style={styles.inputLabel}>Client ID</Text>
+            <TextInput
+              style={styles.input}
+              value={flattradeClientId}
+              onChangeText={setFlattradeClientId}
+              placeholder="Flattrade client id"
+              placeholderTextColor="#64748b"
+              autoCapitalize="characters"
+            />
+            <Text style={styles.inputLabel}>API Key</Text>
+            <TextInput
+              style={styles.input}
+              value={flattradeApiKey}
+              onChangeText={setFlattradeApiKey}
+              placeholder="Flattrade API key"
+              placeholderTextColor="#64748b"
+              autoCapitalize="none"
+            />
+            <Text style={styles.inputLabel}>API Secret</Text>
+            <TextInput
+              style={styles.input}
+              value={flattradeApiSecret}
+              onChangeText={setFlattradeApiSecret}
+              placeholder={flattrade?.configured ? 'Enter only when updating' : 'Flattrade API secret'}
+              placeholderTextColor="#64748b"
+              autoCapitalize="none"
+              secureTextEntry
+            />
+
+            <View style={styles.buttonRow}>
+              <TouchableOpacity
+                style={[styles.primaryButton, styles.buttonFlex, savingBroker && styles.buttonDisabled]}
+                onPress={saveFlattradeCredentials}
+                disabled={savingBroker}
+              >
+                <Text style={styles.primaryButtonText}>{savingBroker ? 'SAVING' : 'SAVE FLATTRADE'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.outlineButton, styles.buttonFlex, (!flattrade?.configured || authorizingBroker) && styles.buttonDisabled]}
+                onPress={authorizeFlattrade}
+                disabled={!flattrade?.configured || authorizingBroker}
+              >
+                <Text style={styles.outlineButtonText}>{authorizingBroker ? 'OPENING' : 'AUTHORIZE'}</Text>
+              </TouchableOpacity>
+            </View>
+
+            {flattrade?.configured ? (
+              <TouchableOpacity style={[styles.dangerButton, { marginTop: 10 }]} onPress={() => disconnectBroker('flattrade', 'Flattrade')}>
+                <Text style={styles.dangerButtonText}>DISCONNECT FLATTRADE</Text>
+              </TouchableOpacity>
+            ) : null}
+          </>
         )}
       </View>
 
@@ -252,7 +403,7 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
           <View style={[styles.statusDot, liveReadiness?.live_enabled ? styles.statusDotLive : styles.statusDotBlocked]} />
           <View style={styles.statusTextWrap}>
             <Text style={liveReadiness?.live_enabled ? styles.connectedTitle : styles.blockedTitle}>
-              {liveReadiness?.live_enabled ? 'Live trading ready' : 'Live trading locked'}
+              {liveReadiness?.live_enabled ? `${selectedBrokerName} live ready` : `${selectedBrokerName} live locked`}
             </Text>
             <Text style={styles.cardText}>
               {liveReadiness?.backend_outbound_ip ? `Backend IP: ${liveReadiness.backend_outbound_ip}` : 'Backend IP: checking'}
@@ -302,7 +453,7 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.outlineButton, styles.buttonFlex]}
-            onPress={() => fetchLiveReadiness(true)}
+            onPress={() => fetchLiveReadiness(selectedBrokerId, true)}
           >
             <Text style={styles.outlineButtonText}>REFRESH IP</Text>
           </TouchableOpacity>
@@ -363,6 +514,39 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 14,
     marginBottom: 8,
+  },
+  brokerGrid: {
+    gap: 8,
+    marginBottom: 8,
+  },
+  brokerCard: {
+    backgroundColor: '#101722',
+    borderColor: '#273244',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 14,
+  },
+  brokerCardSelected: {
+    borderColor: '#3b82f6',
+    backgroundColor: '#0f1b2d',
+  },
+  statusPill: {
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    minWidth: 54,
+    alignItems: 'center',
+  },
+  statusPillConnected: {
+    backgroundColor: '#064e3b',
+  },
+  statusPillMuted: {
+    backgroundColor: '#334155',
+  },
+  statusPillText: {
+    color: '#f8fafc',
+    fontSize: 9,
+    fontWeight: '700',
   },
   cardTitle: { color: '#f8fafc', fontSize: 15, fontWeight: '700', marginBottom: 4 },
   cardText: { color: '#94a3b8', fontSize: 12, lineHeight: 17 },

@@ -19,7 +19,13 @@ import requests
 
 from backend.database import init_db, get_db, SessionLocal, Signal, Position, DailyConsent, User, BrokerOrder, BrokerAuthState, BrokerLiveSetting, AppAuthSession
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
-from backend.flattrade_client import place_flattrade_order, exchange_request_code
+from backend.flattrade_client import (
+    FlattradeError,
+    exchange_request_code,
+    place_flattrade_order,
+    place_order as place_flattrade_prepared_order,
+    prepare_order as prepare_flattrade_order,
+)
 from backend.aliceblue_client import (
     AliceBlueError,
     AliceBlueOrderStatusUnknown,
@@ -2283,7 +2289,10 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
                 continue
                 
     if not target_user_id:
-        target_user_id = creds_list[0].user_id if creds_list else 1
+        return HTMLResponse(
+            content="<h2>Error: Could not match this Flattrade login to an app user. Please save the correct Flattrade Client ID in the app and try again.</h2>",
+            status_code=400
+        )
         
     mgr = AppCredentialsManager(db, user_id=target_user_id)
     creds = mgr.load_credentials("flattrade")
@@ -2330,14 +2339,34 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
     """
     return HTMLResponse(content=html_content)
 
+@app.post("/api/broker/flattrade/login-url")
+def flattrade_login_url(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    mgr = AppCredentialsManager(db, user_id=user.id)
+    creds = mgr.load_credentials("flattrade")
+    if not creds:
+        raise HTTPException(status_code=400, detail="Save Flattrade credentials before authorizing a session")
+    api_key = (creds.get("api_key") or "").strip()
+    client_id = (creds.get("extra", {}) or {}).get("client_id")
+    if not api_key or not client_id:
+        raise HTTPException(status_code=400, detail="Flattrade Client ID and API Key are required")
+
+    start_url = f"https://auth.flattrade.in/?app_key={quote(api_key)}"
+    return {"login_url": start_url}
+
 @app.get("/api/broker/login/{broker_id}")
 def broker_login_redirect(broker_id: str, token: str = Query(None), db: Session = Depends(get_db)):
     user = None
     if token:
-        user_info = get_user_from_token(token)
-        if user_info:
-            supabase_uid = user_info.get("id")
-            user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
+        user = get_app_session_user(token, db)
+        if not user:
+            user_info = get_user_from_token(token)
+            if user_info:
+                supabase_uid = user_info.get("id")
+                user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
             
     if not user and env_flag("ALLOW_SANDBOX_AUTH"):
         user = db.query(User).filter(User.id == 1).first()
@@ -2458,7 +2487,7 @@ def resolve_manual_trade(signal: Signal, trade_type: str, lots: float) -> dict:
 
 BROKER_FUNDS_CACHE = {}
 BROKER_OUTBOUND_IP_CACHE = {"value": None, "checked_at": None}
-SUPPORTED_LIVE_BROKERS = {"aliceblue": "Alice Blue"}
+SUPPORTED_LIVE_BROKERS = {"aliceblue": "Alice Blue", "flattrade": "Flattrade"}
 
 
 def _broker_proxy_url() -> Optional[str]:
@@ -2533,20 +2562,36 @@ def build_live_readiness(user: User, db: Session, broker_id: str = "aliceblue", 
     outbound_ip = get_backend_outbound_ip(force_refresh=force_ip_refresh)
     static_ip_check_required = env_flag("LIVE_STATIC_IP_CHECK_REQUIRED", True)
     static_ip_matches = bool(static_ip and outbound_ip and static_ip == outbound_ip)
-    credentials_connected = bool(mgr.has_credentials(broker_id))
+    credentials = mgr.load_credentials(broker_id) if mgr.has_credentials(broker_id) else None
+    credentials_connected = bool(credentials)
     vendor_configured = is_aliceblue_vendor_configured() if broker_id == "aliceblue" else False
     server_live_enabled = env_flag("LIVE_TRADING_ENABLED")
     test_account_blocked = is_test_login_phone(user.phone) and not env_flag("ALLOW_TEST_LOGIN_LIVE_TRADING")
+    signing_secret_configured = bool(
+        os.environ.get("BROKER_AUTH_STATE_SECRET", "").strip()
+        or os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    )
+    encryption_configured = bool(os.environ.get("CREDENTIAL_ENCRYPTION_KEY", "").strip())
+    flattrade_session_ready = False
+    if broker_id == "flattrade" and credentials:
+        extra = credentials.get("extra", {}) or {}
+        flattrade_session_ready = bool(extra.get("token") and extra.get("token_date") == get_ist_time().date().isoformat())
 
     blockers = []
     if broker_id not in SUPPORTED_LIVE_BROKERS:
         blockers.append("This broker is not wired for live execution yet")
     if not server_live_enabled:
         blockers.append("Server live trading switch is off")
-    if not vendor_configured:
+    if broker_id == "aliceblue" and not vendor_configured:
         blockers.append("Alice Blue Vendor API is not configured on the server")
+    if not signing_secret_configured:
+        blockers.append("Live order preview signing secret is not configured on the server")
+    if not encryption_configured:
+        blockers.append("Broker credential encryption is not configured on the server")
     if not credentials_connected or active_id != broker_id:
-        blockers.append("Connect Alice Blue before placing live orders")
+        blockers.append(f"Connect {SUPPORTED_LIVE_BROKERS.get(broker_id, broker_id.title())} before placing live orders")
+    if broker_id == "flattrade" and credentials_connected and not flattrade_session_ready:
+        blockers.append("Authorize today's Flattrade session")
     if not static_ip:
         blockers.append("Add the broker/exchange-approved static IP")
     if static_ip and not static_registered:
@@ -2562,7 +2607,7 @@ def build_live_readiness(user: User, db: Session, broker_id: str = "aliceblue", 
         not blockers
         and broker_id in SUPPORTED_LIVE_BROKERS
         and server_live_enabled
-        and vendor_configured
+        and (vendor_configured if broker_id == "aliceblue" else True)
         and credentials_connected
         and active_id == broker_id
     )
@@ -2574,6 +2619,7 @@ def build_live_readiness(user: User, db: Session, broker_id: str = "aliceblue", 
         "server_live_enabled": server_live_enabled,
         "vendor_configured": vendor_configured,
         "credentials_connected": credentials_connected,
+        "daily_session_ready": flattrade_session_ready if broker_id == "flattrade" else None,
         "static_ip": static_ip,
         "static_ip_registered": static_registered,
         "backend_outbound_ip": outbound_ip,
@@ -2669,14 +2715,14 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
         combined_pnl += pnl
             
     if active_id:
-        masked = mgr.get_masked_info(active_id)
-        readiness = build_live_readiness(user, db, active_id) if active_id == "aliceblue" else None
+        masked = mgr.get_masked_info(active_id) or {"broker_id": active_id}
+        readiness = build_live_readiness(user, db, active_id) if active_id in SUPPORTED_LIVE_BROKERS else None
         live_enabled = bool(readiness and readiness["live_enabled"])
         balance = get_cached_broker_balance(user.id, active_id, db) if live_enabled else None
         return {
             "status": "linked",
             "broker_id": active_id,
-            "broker_name": "Alice Blue" if active_id == "aliceblue" else masked["broker_id"].capitalize(),
+            "broker_name": SUPPORTED_LIVE_BROKERS.get(active_id, masked["broker_id"].capitalize()),
             "balance": balance or 0.0,
             "balance_available": balance is not None,
             "mode": "LIVE" if live_enabled else "LINKED",
@@ -2710,6 +2756,35 @@ def require_daily_live_consent(user_id: int, db: Session) -> None:
         )
 
 
+def prepare_live_order_for_broker(broker_id: str, resolved: dict, signal: Signal, lots: float) -> dict:
+    if broker_id == "aliceblue":
+        return prepare_aliceblue_order(
+            symbol=resolved["trade_symbol"],
+            direction=resolved["direction"],
+            lots=lots,
+            price=resolved["entry_price"],
+            trade_type=signal.trade_type or "INTRADAY",
+        )
+    if broker_id == "flattrade":
+        return prepare_flattrade_order(
+            symbol=resolved["trade_symbol"],
+            direction=resolved["direction"],
+            lots=lots,
+            quantity=int(resolved["qty"]),
+            price=resolved["entry_price"],
+            trade_type=signal.trade_type or "INTRADAY",
+        )
+    raise HTTPException(status_code=400, detail=f"{broker_id} live execution is not supported")
+
+
+def submit_prepared_live_order(broker_id: str, user_id: int, db: Session, prepared: dict, order_tag: str) -> dict:
+    if broker_id == "aliceblue":
+        return place_aliceblue_order(user_id, db, prepared, order_tag=order_tag)
+    if broker_id == "flattrade":
+        return place_flattrade_prepared_order(user_id, db, prepared, order_tag=order_tag)
+    raise HTTPException(status_code=400, detail=f"{broker_id} live execution is not supported")
+
+
 @app.post("/api/broker/order-preview")
 def preview_broker_order(
     req: OrderPreviewRequest,
@@ -2718,7 +2793,11 @@ def preview_broker_order(
 ):
     if req.mode.upper() != "LIVE":
         raise HTTPException(status_code=400, detail="Order preview is only required for live orders")
-    require_live_trading_ready(user, db, "aliceblue")
+    manager = AppCredentialsManager(db, user_id=user.id)
+    active_broker = manager.get_active_broker()
+    if active_broker not in SUPPORTED_LIVE_BROKERS:
+        raise HTTPException(status_code=400, detail="Connect a supported live broker before previewing a live order")
+    require_live_trading_ready(user, db, active_broker)
     max_live_lots = max(1, int(os.environ.get("MAX_LIVE_LOTS_PER_ORDER", "10")))
     if req.lots > max_live_lots:
         raise HTTPException(status_code=400, detail=f"Live orders are limited to {max_live_lots} lots")
@@ -2733,18 +2812,13 @@ def preview_broker_order(
 
     resolved = resolve_manual_trade(signal, req.trade_type, req.lots)
     try:
-        prepared = prepare_aliceblue_order(
-            symbol=resolved["trade_symbol"],
-            direction=resolved["direction"],
-            lots=req.lots,
-            price=resolved["entry_price"],
-            trade_type=signal.trade_type or "INTRADAY",
-        )
+        prepared = prepare_live_order_for_broker(active_broker, resolved, signal, req.lots)
         preview_token = create_signed_token(
             {
                 "purpose": "live_order_preview",
                 "user_id": user.id,
                 "signal_id": signal.id,
+                "broker_id": active_broker,
                 "trade_type": req.trade_type.upper(),
                 "mode": "LIVE",
                 "lots": int(req.lots),
@@ -2752,7 +2826,7 @@ def preview_broker_order(
             },
             90,
         )
-    except (AliceBlueError, RuntimeError) as exc:
+    except (AliceBlueError, FlattradeError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
@@ -2795,15 +2869,15 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     prepared_live_order = None
     active_broker = None
     if mode == "LIVE":
-        require_live_trading_ready(user, db, "aliceblue")
-        require_daily_live_consent(user.id, db)
         mgr = AppCredentialsManager(db, user_id=user.id)
         active_broker = mgr.get_active_broker()
-        if active_broker != "aliceblue":
+        if active_broker not in SUPPORTED_LIVE_BROKERS:
             raise HTTPException(
                 status_code=400,
-                detail="Connect Alice Blue before executing a live order",
+                detail="Connect a supported live broker before executing a live order",
             )
+        require_live_trading_ready(user, db, active_broker)
+        require_daily_live_consent(user.id, db)
         if not req.preview_token:
             raise HTTPException(status_code=400, detail="A fresh live-order preview is required")
         try:
@@ -2814,6 +2888,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             "purpose": "live_order_preview",
             "user_id": user.id,
             "signal_id": signal.id,
+            "broker_id": active_broker,
             "trade_type": contract_type,
             "mode": "LIVE",
             "lots": int(req.lots),
@@ -2889,7 +2964,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         broker_order = BrokerOrder(
             user_id=user.id,
             signal_id=signal.id,
-            broker_id="aliceblue",
+            broker_id=active_broker,
             idempotency_key=idempotency_key,
             order_kind="ENTRY",
             symbol=trade_symbol,
@@ -2914,7 +2989,8 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             ) from exc
 
         try:
-            broker_result = place_aliceblue_order(
+            broker_result = submit_prepared_live_order(
+                active_broker,
                 user.id,
                 db,
                 prepared_live_order,
@@ -2932,6 +3008,12 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             broker_order.updated_at = get_ist_time()
             db.commit()
             raise HTTPException(status_code=400, detail=f"Alice Blue order failed: {exc}") from exc
+        except FlattradeError as exc:
+            broker_order.status = "REJECTED"
+            broker_order.broker_response = json.dumps({"error": str(exc)})
+            broker_order.updated_at = get_ist_time()
+            db.commit()
+            raise HTTPException(status_code=400, detail=f"Flattrade order failed: {exc}") from exc
 
         broker_order.status = "SUBMITTED"
         broker_order.broker_order_id = broker_result["broker_order_id"]
@@ -2953,7 +3035,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         signal_id=req.signal_id,
         timeframe=signal.timeframe,
         trade_type=signal.trade_type,
-        broker_id="aliceblue" if mode == "LIVE" else None,
+        broker_id=active_broker if mode == "LIVE" else None,
         broker_instrument_id=prepared_live_order.get("instrument_id") if prepared_live_order else None,
         broker_trading_symbol=prepared_live_order.get("trading_symbol") if prepared_live_order else None,
         entry_broker_order_id=broker_result.get("broker_order_id") if broker_result else None,
