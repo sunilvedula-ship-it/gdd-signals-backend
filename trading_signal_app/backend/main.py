@@ -159,6 +159,25 @@ def configured_test_login_phones() -> set:
 def is_test_login_phone(phone: Optional[str]) -> bool:
     return normalize_phone_number(phone) in configured_test_login_phones()
 
+def configured_admin_phone_numbers() -> set:
+    raw = os.environ.get("ADMIN_PHONE_NUMBERS", "+918919859974")
+    return {
+        normalize_phone_number(phone)
+        for phone in raw.split(",")
+        if normalize_phone_number(phone)
+    }
+
+def is_administrator(user: User) -> bool:
+    admin_emails = {
+        value.strip().lower()
+        for value in os.environ.get("ADMIN_EMAILS", "").split(",")
+        if value.strip()
+    }
+    is_local_admin = env_flag("ALLOW_SANDBOX_AUTH") and user.id == 1
+    is_email_admin = bool(user.email and user.email.lower() in admin_emails)
+    is_phone_admin = normalize_phone_number(user.phone) in configured_admin_phone_numbers()
+    return is_local_admin or is_email_admin or is_phone_admin
+
 def get_test_login_payload(token: str) -> Optional[dict]:
     if not env_flag("TEST_LOGIN_ENABLED", True):
         return None
@@ -3183,13 +3202,7 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
 
 @app.post("/api/admin/purge-test-data")
 def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    admin_emails = {
-        value.strip().lower()
-        for value in os.environ.get("ADMIN_EMAILS", "").split(",")
-        if value.strip()
-    }
-    is_local_admin = env_flag("ALLOW_SANDBOX_AUTH") and user.id == 1
-    if not is_local_admin and (not user.email or user.email.lower() not in admin_emails):
+    if not is_administrator(user):
         raise HTTPException(status_code=403, detail="Administrator access required")
     try:
         num_positions = db.query(Position).filter(Position.user_id == user.id).delete()

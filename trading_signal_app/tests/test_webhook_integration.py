@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
 from backend.database import AppAuthSession, BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
-from backend.main import app, build_tradingview_option_ticker, get_ist_time, get_tradingview_price, pick_tradingview_price, square_off_expired_intraday_positions
+from backend.main import app, build_tradingview_option_ticker, get_ist_time, get_tradingview_price, is_administrator, pick_tradingview_price, square_off_expired_intraday_positions
 
 
 class BankNiftyWebhookIntegrationTests(unittest.TestCase):
@@ -225,6 +225,20 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
             db.commit()
         finally:
             db.close()
+
+    def test_configured_phone_is_administrator(self):
+        admin = User(id=42, email=None, phone="91 8919859974")
+        regular_user = User(id=43, email=None, phone="+919043055445")
+
+        with patch.dict(
+            os.environ,
+            {
+                "ADMIN_PHONE_NUMBERS": "+91 8919859974",
+                "ALLOW_SANDBOX_AUTH": "false",
+            },
+        ):
+            self.assertTrue(is_administrator(admin))
+            self.assertFalse(is_administrator(regular_user))
 
     def test_aliceblue_live_preview_and_submission_are_audited(self):
         db = SessionLocal()
