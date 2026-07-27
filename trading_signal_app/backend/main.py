@@ -460,101 +460,93 @@ MONTH_MAP = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
 }
 
+def normalize_option_underlying(underlying: str) -> str:
+    value = underlying.upper().strip()
+    if value in ["BNF", "BANKNIFTY"]:
+        return "BANKNIFTY"
+    if value in ["NIFTY", "NIFTY50"]:
+        return "NIFTY"
+    if value in ["BSX", "SENSEX"]:
+        return "SENSEX"
+    return value
+
+def parse_option_expiry(expiry_str: str) -> Optional[date]:
+    value = expiry_str.upper().strip()
+    for fmt in ("%d%b%y", "%d%b%Y", "%y%m%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except Exception:
+            pass
+    return None
+
+def format_option_strike(strike: float) -> str:
+    return str(int(strike)) if float(strike).is_integer() else str(strike)
+
+def build_option_parse_result(underlying: str, expiry_date: Optional[date], strike: float, opt_type: str) -> dict:
+    normalized_underlying = normalize_option_underlying(underlying)
+    strike_value = int(strike) if float(strike).is_integer() else float(strike)
+    expiry_label = expiry_date.strftime("%d%b%y").upper() if expiry_date else ""
+    if expiry_label:
+        formatted_symbol = f"{normalized_underlying} {expiry_label} {format_option_strike(float(strike))} {opt_type}"
+    else:
+        formatted_symbol = f"{normalized_underlying} {format_option_strike(float(strike))} {opt_type}"
+    return {
+        "is_option": True,
+        "underlying": normalized_underlying,
+        "expiry_date": expiry_date,
+        "strike": strike_value,
+        "opt_type": opt_type,
+        "formatted_symbol": formatted_symbol,
+    }
+
 def parse_option_symbol(symbol: str) -> dict:
     s = symbol.upper().strip()
     if ":" in s:
         s = s.split(":")[-1]
+
+    # Format 0: TradingView/NSE option chart format, e.g. OPTIDX_NIFTY_28JUL2026_CE_23950
+    match_optidx = re.match(
+        r'^(?:OPTIDX_)?([A-Z]+)_([0-9]{1,2}[A-Z]{3}[0-9]{2,4})_(CE|PE)_(\d+(?:\.\d+)?)$',
+        s,
+    )
+    if match_optidx:
+        underlying = match_optidx.group(1)
+        expiry_date = parse_option_expiry(match_optidx.group(2))
+        opt_type = match_optidx.group(3)
+        strike = float(match_optidx.group(4))
+        return build_option_parse_result(underlying, expiry_date, strike, opt_type)
         
     # Format 1: Space separated with explicit expiry e.g. NIFTY 09JUN26 23500 CE
-    match_space = re.match(r'^([A-Z]+)\s+([0-9A-Z]{6,7})\s+(\d+)\s+(CE|PE)$', s)
+    match_space = re.match(r'^([A-Z]+)\s+([0-9A-Z]{6,9})\s+(\d+(?:\.\d+)?)\s+(CE|PE)$', s)
     if match_space:
         underlying = match_space.group(1)
         expiry_str = match_space.group(2)
-        strike = int(match_space.group(3))
+        strike = float(match_space.group(3))
         opt_type = match_space.group(4)
         
         # Parse expiry date
-        expiry_date = None
-        try:
-            expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
-        except Exception:
-            try:
-                expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
-            except Exception:
-                pass
-                
-        if underlying in ["BNF", "BANKNIFTY"]:
-            underlying = "BANKNIFTY"
-        elif underlying in ["NIFTY"]:
-            underlying = "NIFTY"
-        elif underlying in ["BSX", "SENSEX"]:
-            underlying = "SENSEX"
-            
-        return {
-            "is_option": True,
-            "underlying": underlying,
-            "expiry_date": expiry_date,
-            "strike": strike,
-            "opt_type": opt_type,
-            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
-        }
+        expiry_date = parse_option_expiry(expiry_str)
+        return build_option_parse_result(underlying, expiry_date, strike, opt_type)
         
     # Format 2: Space separated without expiry (fallback ATM calculation) e.g. BANKNIFTY 54400 CE
-    match_no_expiry = re.match(r'^([A-Z]+)\s+(\d+)\s+(CE|PE)$', s)
+    match_no_expiry = re.match(r'^([A-Z]+)\s+(\d+(?:\.\d+)?)\s+(CE|PE)$', s)
     if match_no_expiry:
         underlying = match_no_expiry.group(1)
-        strike = int(match_no_expiry.group(2))
+        strike = float(match_no_expiry.group(2))
         opt_type = match_no_expiry.group(3)
-        
-        if underlying in ["BNF", "BANKNIFTY"]:
-            underlying = "BANKNIFTY"
-        elif underlying in ["NIFTY"]:
-            underlying = "NIFTY"
-        elif underlying in ["BSX", "SENSEX"]:
-            underlying = "SENSEX"
-            
-        return {
-            "is_option": True,
-            "underlying": underlying,
-            "expiry_date": None,
-            "strike": strike,
-            "opt_type": opt_type,
-            "formatted_symbol": f"{underlying} {strike} {opt_type}"
-        }
+        return build_option_parse_result(underlying, None, strike, opt_type)
 
     # Format 3: NSE compact format e.g. NIFTY09JUN26C23500 or BANKNIFTY260625C54400
-    match_nse = re.match(r'^([A-Z]+)([0-9A-Z]{6,7})([CP])(\d+)$', s)
+    match_nse = re.match(r'^([A-Z]+)([0-9A-Z]{6,9})([CP])(\d+(?:\.\d+)?)$', s)
     if match_nse:
         underlying = match_nse.group(1)
         expiry_str = match_nse.group(2)
         opt_char = match_nse.group(3)
-        strike = int(match_nse.group(4))
+        strike = float(match_nse.group(4))
         
-        expiry_date = None
-        try:
-            expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
-        except Exception:
-            try:
-                expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
-            except Exception:
-                pass
-                
-        if underlying in ["BNF", "BANKNIFTY"]:
-            underlying = "BANKNIFTY"
-        elif underlying in ["NIFTY"]:
-            underlying = "NIFTY"
-        elif underlying in ["BSX", "SENSEX"]:
-            underlying = "SENSEX"
-            
+        expiry_date = parse_option_expiry(expiry_str)
         opt_type = "CE" if opt_char == "C" else "PE"
-        return {
-            "is_option": True,
-            "underlying": underlying,
-            "expiry_date": expiry_date,
-            "strike": strike,
-            "opt_type": opt_type,
-            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
-        }
+        return build_option_parse_result(underlying, expiry_date, strike, opt_type)
         
     # Format 4: BSE compact format e.g. SENSEX2660474800CE
     match_bse = re.match(r'^([A-Z]+)(\d{2})(10|11|12|[1-9]|[OND])(\d{2})(\d+)(CE|PE)$', s)
@@ -584,21 +576,7 @@ def parse_option_symbol(symbol: str) -> dict:
         except Exception:
             expiry_date = None
             
-        if underlying in ["BNF", "BANKNIFTY"]:
-            underlying = "BANKNIFTY"
-        elif underlying in ["NIFTY"]:
-            underlying = "NIFTY"
-        elif underlying in ["BSX", "SENSEX"]:
-            underlying = "SENSEX"
-            
-        return {
-            "is_option": True,
-            "underlying": underlying,
-            "expiry_date": expiry_date,
-            "strike": strike,
-            "opt_type": opt_type,
-            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
-        }
+        return build_option_parse_result(underlying, expiry_date, float(strike), opt_type)
 
     return {"is_option": False}
 
@@ -692,10 +670,14 @@ def get_option_market_price_or_estimate(
     opt_type: str,
     underlying_price: Optional[float] = None,
     expiry_date: Optional[date] = None,
-) -> tuple[float, str]:
+    allow_estimate: bool = False,
+) -> tuple[Optional[float], str]:
     live_option_price = get_live_market_price(option_symbol)
     if live_option_price is not None and live_option_price > 0:
         return round(float(live_option_price), 2), "MARKET_LTP"
+
+    if not allow_estimate:
+        return None, "UNAVAILABLE"
 
     index_price = underlying_price
     if index_price is None or index_price <= 0 or index_price < 0.2 * strike:
@@ -745,6 +727,114 @@ def extract_strike_from_symbol(symbol: str) -> Optional[float]:
         return float(parse_res["strike"])
     return None
 
+def parse_float_value(value) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text_value = str(value).replace(",", "").replace("\u20b9", "").strip()
+    text_value = re.sub(r"(?i)\bRS\.?\s*", "", text_value)
+    match = re.search(r"-?\d+(?:\.\d+)?", text_value)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+def extract_option_symbol_from_text(text_value: str) -> Optional[str]:
+    if not text_value:
+        return None
+    patterns = [
+        r"\b(?:OPTIDX_)?[A-Z]+_[0-9]{1,2}[A-Z]{3}[0-9]{2,4}_(?:CE|PE)_\d+(?:\.\d+)?\b",
+        r"\b[A-Z]+\s+[0-9]{1,2}[A-Z]{3}[0-9]{2,4}\s+\d+(?:\.\d+)?\s+(?:CE|PE)\b",
+        r"\b[A-Z]+[0-9]{6}(?:C|P)\d+(?:\.\d+)?\b",
+    ]
+    upper_text = text_value.upper()
+    for pattern in patterns:
+        match = re.search(pattern, upper_text)
+        if match:
+            parsed = parse_option_symbol(match.group(0))
+            if parsed.get("is_option") and parsed.get("expiry_date"):
+                return parsed["formatted_symbol"]
+    return None
+
+def extract_option_symbol_from_payload(payload: dict, body_str: str) -> Optional[str]:
+    for key in [
+        "option_symbol",
+        "optionSymbol",
+        "option",
+        "contract",
+        "contract_symbol",
+        "instrument",
+        "instrument_symbol",
+        "trading_symbol",
+        "tradingsymbol",
+    ]:
+        candidate = payload.get(key)
+        if candidate:
+            parsed = parse_option_symbol(str(candidate))
+            if parsed.get("is_option") and parsed.get("expiry_date"):
+                return parsed["formatted_symbol"]
+
+    for value in payload.values():
+        if isinstance(value, str):
+            candidate = extract_option_symbol_from_text(value)
+            if candidate:
+                return candidate
+    return extract_option_symbol_from_text(body_str)
+
+def extract_option_price_from_payload(payload: dict, action_norm: str) -> Optional[float]:
+    exit_keys = [
+        "exit_option_price",
+        "exitOptionPrice",
+        "option_exit_price",
+        "optionExitPrice",
+        "exit_premium",
+        "exitPremium",
+    ]
+    entry_keys = [
+        "entry_option_price",
+        "entryOptionPrice",
+        "option_entry_price",
+        "optionEntryPrice",
+        "entry_premium",
+        "entryPremium",
+    ]
+    common_keys = [
+        "option_price",
+        "optionPrice",
+        "option_ltp",
+        "optionLtp",
+        "premium",
+        "ltp",
+    ]
+
+    keys = exit_keys + common_keys if action_norm in {"EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"} else entry_keys + common_keys
+    for key in keys:
+        if key in payload:
+            parsed_price = parse_float_value(payload.get(key))
+            if parsed_price is not None and parsed_price > 0:
+                return parsed_price
+    return None
+
+def infer_exit_action_from_context(action_context: str) -> Optional[str]:
+    text_value = re.sub(r"[_-]+", " ", action_context.upper())
+    if re.search(r"\b(SELL\s*ALERT|EXIT\s+LONG|LONG\s+EXIT)\b", text_value):
+        return "EXIT_LONG"
+    if re.search(r"\b(COVER\s*ALERT|EXIT\s+SHORT|SHORT\s+EXIT)\b", text_value):
+        return "EXIT_SHORT"
+    if re.search(r"\b(EXIT|TARGET\s*HIT|SIGNAL\s+EXIT)\b.{0,80}\bLONG\b", text_value):
+        return "EXIT_LONG"
+    if re.search(r"\b(EXIT|TARGET\s*HIT|SIGNAL\s+EXIT)\b.{0,80}\bSHORT\b", text_value):
+        return "EXIT_SHORT"
+    return None
+
+def get_position_exit_input_price(pos: Position, fallback_price: float, payload_option_price: Optional[float]) -> float:
+    if payload_option_price is not None and parse_option_symbol(pos.symbol).get("is_option"):
+        return payload_option_price
+    return fallback_price
+
 def close_position_entry(pos: Position, index_exit_price: float, db: Session, reason: Optional[str] = None) -> float:
     parse_res = parse_option_symbol(pos.symbol)
     if reason:
@@ -767,6 +857,8 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session, re
                 underlying_price=index_exit_price,
                 expiry_date=expiry_date,
             )
+            if exit_price is None:
+                raise Exception(f"Option LTP unavailable for {pos.symbol}; exit price was not recorded")
     else:
         exit_price = index_exit_price
         
@@ -1163,6 +1255,9 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         
     # 2. Resolve Symbol
     symbol = payload.get("symbol") or payload.get("ticker")
+    explicit_option_symbol = extract_option_symbol_from_payload(payload, body_str)
+    if explicit_option_symbol:
+        symbol = explicit_option_symbol
     if not symbol and body_str:
         # Fallback to search inside raw body text
         for sym_cand in ["BTCUSD", "ETHUSD", "BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"]:
@@ -1243,7 +1338,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     action_norm = "EXIT" # Default fallback
     
     if is_target_hit:
-        action_norm = "EXIT"
+        action_norm = infer_exit_action_from_context(action_context) or "EXIT"
     elif raw_action:
         act_lower = str(raw_action).lower()
         if act_lower in ["exit_long", "exitlong"]:
@@ -1251,7 +1346,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         elif act_lower in ["exit_short", "exitshort", "cover"]:
             action_norm = "EXIT_SHORT"
         elif act_lower in ["exit", "close"]:
-            action_norm = "EXIT"
+            dir_str = str(raw_dir or "").upper()
+            if "LONG" in dir_str or "BUY" in dir_str:
+                action_norm = "EXIT_LONG"
+            elif "SHORT" in dir_str or "SELL" in dir_str:
+                action_norm = "EXIT_SHORT"
+            else:
+                action_norm = infer_exit_action_from_context(action_context) or "EXIT"
         elif act_lower in ["buy", "long"]:
             action_norm = "LONG"
         elif act_lower in ["sell", "short"]:
@@ -1269,7 +1370,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         elif "EXIT_SHORT" in key_str or "COVER" in key_str:
             action_norm = "EXIT_SHORT"
         elif "EXIT" in key_str or "CLOSE" in key_str:
-            action_norm = "EXIT"
+            action_norm = infer_exit_action_from_context(action_context) or "EXIT"
         elif "LONG" in key_str or "BUY" in key_str:
             action_norm = "LONG"
         elif "SHORT" in key_str or "SELL" in key_str:
@@ -1322,6 +1423,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
             
     # Resolve source
+    payload_option_price = extract_option_price_from_payload(payload, action_norm)
+
     source = payload.get("source") or ("TradingView" if (raw_key or "tradingview" in body_str.lower()) else "Scanner")
     source_name = payload.get("orderId") or payload.get("signal_type") or "Webhook Strategy Alert"
 
@@ -1396,11 +1499,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         opt_type = parse_res["opt_type"]
         expiry_date = parse_res.get("expiry_date")
         
+        if payload_option_price is not None:
+            opt_premium = payload_option_price
         # If the price in payload is at the scale of an option premium
-        if price_val > 0 and price_val < 0.2 * opt_strike:
+        elif price_val > 0 and price_val < 0.2 * opt_strike:
             opt_premium = price_val
         else:
-            # Price is index price or 0. Fetch actual option premium first, then estimate only as fallback.
+            # Price is index price or 0. Fetch actual option premium; do not record synthetic prices as trades.
             index_p = price_val if price_val > 0 else (get_live_market_price(underlying_norm) or opt_strike)
             opt_premium, _price_source = get_option_market_price_or_estimate(
                 opt_symbol,
@@ -1432,14 +1537,17 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 expiry_date = get_next_weekly_expiry(ist_now, 1)
                 
             opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-            opt_premium, _price_source = get_option_market_price_or_estimate(
-                opt_symbol,
-                underlying_norm,
-                opt_strike,
-                opt_type,
-                underlying_price=price_val,
-                expiry_date=expiry_date,
-            )
+            if payload_option_price is not None:
+                opt_premium = payload_option_price
+            else:
+                opt_premium, _price_source = get_option_market_price_or_estimate(
+                    opt_symbol,
+                    underlying_norm,
+                    opt_strike,
+                    opt_type,
+                    underlying_price=price_val,
+                    expiry_date=expiry_date,
+                )
             
     # Check for open positions on this symbol or its options
     # Save signal in database in IST
@@ -1530,7 +1638,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
             if user_open_positions:
                 for p in user_open_positions:
-                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
+                    exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
+                    safe_close_position_entry(p, exit_input_price, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
                 
                 if not is_explicit_long_entry:
                     trade_log.append(f"User {user.id}: Covered SHORT position on {symbol_norm} (flat)")
@@ -1542,13 +1651,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                     safe_open_position_entry(symbol_norm, "LONG", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                 else:
                     if is_option_signal:
-                        qty = calculate_trade_qty(underlying_norm)
-                        safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        if opt_premium is not None:
+                            qty = calculate_trade_qty(underlying_norm)
+                            safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        else:
+                            trade_log.append(f"User {user.id}: Option entry skipped for {symbol_norm} because live option LTP was unavailable")
                     else:
                         # Standard signal (e.g. NIFTY) -> Trade Option
-                        if opt_symbol and opt_premium:
+                        if opt_symbol and opt_premium is not None:
                             qty = calculate_trade_qty(underlying_norm)
                             safe_open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        elif opt_symbol:
+                            trade_log.append(f"User {user.id}: Option entry skipped for {opt_symbol} because live option LTP was unavailable")
                         else:
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
@@ -1565,7 +1679,8 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             
             if user_open_positions:
                 for p in user_open_positions:
-                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
+                    exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
+                    safe_close_position_entry(p, exit_input_price, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
                 
                 if not is_explicit_short_entry:
                     trade_log.append(f"User {user.id}: Exited LONG position on {symbol_norm} (flat)")
@@ -1577,13 +1692,18 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                     safe_open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
                 else:
                     if is_option_signal:
-                        qty = calculate_trade_qty(underlying_norm)
-                        safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        if opt_premium is not None:
+                            qty = calculate_trade_qty(underlying_norm)
+                            safe_open_position_entry(symbol_norm, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {symbol_norm} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        else:
+                            trade_log.append(f"User {user.id}: Option entry skipped for {symbol_norm} because live option LTP was unavailable")
                     else:
                         # Standard signal (e.g. NIFTY) -> Trade Option (PE is bought, direction is LONG)
-                        if opt_symbol and opt_premium:
+                        if opt_symbol and opt_premium is not None:
                             qty = calculate_trade_qty(underlying_norm)
                             safe_open_position_entry(opt_symbol, "LONG", opt_premium, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Option LONG position for {opt_symbol} (Premium: {opt_premium:.2f}, Qty: {qty}) in {mode_val} mode")
+                        elif opt_symbol:
+                            trade_log.append(f"User {user.id}: Option entry skipped for {opt_symbol} because live option LTP was unavailable")
                         else:
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
@@ -1604,9 +1724,10 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                         should_close = True
                         
                     if should_close:
+                        exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
                         safe_close_position_entry(
                             p,
-                            price_val,
+                            exit_input_price,
                             db,
                             trade_log,
                             "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})",
@@ -1924,6 +2045,8 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             underlying_price=live_underlying,
             expiry_date=expiry_date,
         )
+        if current_premium is None:
+            return round(float(entry_price), 2)
         return round(max(1.0, current_premium), 2)
         
     # 2. Standard future/equity/crypto price resolution
@@ -2588,6 +2711,11 @@ def resolve_manual_trade(signal: Signal, trade_type: str, lots: float) -> dict:
             underlying_price=underlying_price,
             expiry_date=expiry_date,
         )
+        if entry_price is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Live option LTP unavailable for {trade_symbol}. Send the option premium in the alert or retry when broker/market data is available.",
+            )
         direction = "LONG"
     else:
         trade_symbol = signal.symbol

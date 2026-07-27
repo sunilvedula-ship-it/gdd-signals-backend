@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from backend.credentials import AppCredentialsManager
 from backend.database import AppAuthSession, BrokerLiveSetting, BrokerOrder, Position, SessionLocal, Signal, User, engine, init_db
-from backend.main import app, build_tradingview_option_ticker, get_ist_time, get_tradingview_price, is_administrator, pick_tradingview_price, square_off_expired_intraday_positions
+from backend.main import app, build_tradingview_option_ticker, get_ist_time, get_tradingview_price, is_administrator, parse_option_symbol, pick_tradingview_price, square_off_expired_intraday_positions
 
 
 class BankNiftyWebhookIntegrationTests(unittest.TestCase):
@@ -51,6 +51,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 "secret": "integration-test-secret",
                 "symbol": "BANKNIFTY",
                 "price": 58450,
+                "option_price": 1123.45,
                 "orderId": "positional_index",
                 "type": "long",
                 "timeframe": "5m"
@@ -129,12 +130,64 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
         self.assertEqual(response.json()["order_status"], "FILLED")
 
     def test_tradingview_option_ticker_and_bid_ask_midpoint(self):
+        parsed = parse_option_symbol("OPTIDX_NIFTY_28JUL2026_CE_23950")
+        self.assertTrue(parsed["is_option"])
+        self.assertEqual(parsed["formatted_symbol"], "NIFTY 28JUL26 23950 CE")
         self.assertEqual(
             build_tradingview_option_ticker("NIFTY 07JUL26 24550 PE"),
             "NSE:NIFTY260707P24550",
         )
         self.assertEqual(pick_tradingview_price([None, None, None, 74.5, 75.5]), 75.0)
         self.assertIsNone(get_tradingview_price("NIFTY 24550 PE"))
+
+    def test_exact_optidx_signal_uses_alert_premium_and_exit_side(self):
+        entry_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "OPTIDX_NIFTY_28JUL2026_CE_23950",
+                "price": 82.80,
+                "orderId": "exact-option-entry-test",
+                "action": "long",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(entry_response.status_code, 200, entry_response.text)
+
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(
+                Position.symbol == "NIFTY 28JUL26 23950 CE",
+                Position.trade_type == "POSITIONAL",
+            ).order_by(Position.id.desc()).first()
+            self.assertIsNotNone(position)
+            self.assertEqual(position.entry_price, 82.80)
+            position_id = position.id
+        finally:
+            db.close()
+
+        exit_response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "OPTIDX_NIFTY_28JUL2026_CE_23950",
+                "price": 74.35,
+                "orderId": "exact-option-exit-test",
+                "action": "exit",
+                "direction": "long",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(exit_response.status_code, 200, exit_response.text)
+
+        db = SessionLocal()
+        try:
+            position = db.query(Position).filter(Position.id == position_id).one()
+            self.assertEqual(position.status, "CLOSED")
+            self.assertEqual(position.exit_price, 74.35)
+            self.assertEqual(position.exit_reason, "SIGNAL_EXIT")
+        finally:
+            db.close()
 
     def test_manual_option_order_uses_live_option_ltp(self):
         db = SessionLocal()
@@ -519,6 +572,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 "secret": "integration-test-secret",
                 "symbol": "SENSEX",
                 "price": 80000,
+                "option_price": 240.0,
                 "orderId": "positional_short_exit_test",
                 "action": "short",
                 "trade_type": "POSITIONAL",
@@ -543,6 +597,7 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
                 "secret": "integration-test-secret",
                 "symbol": "SENSEX",
                 "price": 79900,
+                "option_price": 265.0,
                 "orderId": "positional_short_exit_test",
                 "action": "exit_short",
                 "trade_type": "POSITIONAL",
@@ -555,6 +610,64 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
             position = db.query(Position).filter(Position.id == position_id).one()
             self.assertEqual(position.status, "CLOSED")
             self.assertEqual(position.exit_reason, "SIGNAL_EXIT")
+        finally:
+            db.close()
+
+    def test_target_hit_long_does_not_close_bought_put_option(self):
+        db = SessionLocal()
+        try:
+            ce_position = Position(
+                user_id=1,
+                symbol="NIFTY 28JUL26 23950 CE",
+                direction="LONG",
+                qty=65,
+                entry_price=82.80,
+                status="OPEN",
+                real_or_paper="PAPER",
+                trade_type="POSITIONAL",
+            )
+            pe_position = Position(
+                user_id=1,
+                symbol="NIFTY 28JUL26 24000 PE",
+                direction="LONG",
+                qty=65,
+                entry_price=180.60,
+                status="OPEN",
+                real_or_paper="PAPER",
+                trade_type="POSITIONAL",
+            )
+            db.add_all([ce_position, pe_position])
+            db.commit()
+            ce_id = ce_position.id
+            pe_id = pe_position.id
+        finally:
+            db.close()
+
+        response = self.client.post(
+            "/api/signals/webhook",
+            json={
+                "secret": "integration-test-secret",
+                "symbol": "NIFTY",
+                "price": 23967.6,
+                "option_price": 74.35,
+                "orderId": "target-hit-long-side-test",
+                "action": "Target Hit",
+                "direction": "long",
+                "trade_type": "POSITIONAL",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        db = SessionLocal()
+        try:
+            ce_position = db.query(Position).filter(Position.id == ce_id).one()
+            pe_position = db.query(Position).filter(Position.id == pe_id).one()
+            signal = db.query(Signal).filter(Signal.source_name == "target-hit-long-side-test").order_by(Signal.id.desc()).first()
+            self.assertEqual(signal.action, "EXIT_LONG")
+            self.assertEqual(ce_position.status, "CLOSED")
+            self.assertEqual(ce_position.exit_price, 74.35)
+            self.assertEqual(ce_position.exit_reason, "TARGET_HIT")
+            self.assertEqual(pe_position.status, "OPEN")
         finally:
             db.close()
 

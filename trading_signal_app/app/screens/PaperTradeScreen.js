@@ -323,16 +323,7 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
     const isItemLoss = item.pnl < 0;
     const pnlTextColor = isItemProfit ? styles.textProfit : (isItemLoss ? styles.textLoss : styles.textNeutral);
     
-    const symUpper = (item.symbol || '').toUpperCase();
-    const isPE = symUpper.endsWith(' PE') || symUpper.includes(' PE') || symUpper.endsWith('PE');
-    const isCE = symUpper.endsWith(' CE') || symUpper.includes(' CE') || symUpper.endsWith('CE');
-    
-    let displayDirection = item.direction;
-    if (isPE) {
-      displayDirection = 'SHORT';
-    } else if (isCE) {
-      displayDirection = 'LONG';
-    }
+    const displayDirection = item.direction;
 
     const isLong = displayDirection === 'LONG';
     const isUSD = isCryptoAsset(item.symbol);
