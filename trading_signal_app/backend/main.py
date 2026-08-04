@@ -1236,8 +1236,8 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
     elif s in ["BTCUSD", "BTC", "BTC-USD", "BINANCE:BTCUSD"]:
         tv_ticker = "BINANCE:BTCUSD"
         market = "crypto"
-    elif s in ["GOLDM1!", "GOLD", "GOLDM", "MCX:GOLDM1!"]:
-        tv_ticker = "MCX:GOLDM1!"
+    elif s in ["GOLD1!", "GOLD", "GOLDM", "GOLDM1!", "MCX:GOLD1!", "MCX:GOLDM1!"]:
+        tv_ticker = "MCX:GOLD1!"
         market = "futures"
     elif s in ["CRUDE", "CRUDEOIL", "MCX:CRUDEOIL1!"]:
         tv_ticker = "MCX:CRUDEOIL1!"
@@ -1255,7 +1255,7 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
             tv_ticker = "NSE:BANKNIFTY1!"
             market = "futures"
         elif "GOLD" in s:
-            tv_ticker = "MCX:GOLDM1!"
+            tv_ticker = "MCX:GOLD1!"
             market = "futures"
         else:
             tv_ticker = f"NSE:{s}1!" if not ":" in s else s
@@ -1444,7 +1444,7 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             return round(live_price, 2)
             
         prev_close = price_data.get("previous_close")
-        is_commodity_proxy = s_upper in ["GOLDM1!", "GOLD", "CRUDEOIL", "CRUDE", "SILVER"]
+        is_commodity_proxy = s_upper in ["GOLD1!", "GOLDM1!", "GOLD", "CRUDEOIL", "CRUDE", "SILVER"]
         
         if is_commodity_proxy and prev_close and prev_close > 0:
             # Scale entry price by the proxy ETF/future daily percent change
