@@ -100,23 +100,102 @@ const calculatePnLSum = (items) => {
   return { inr: inrSum, usd: usdSum };
 };
 
-const getGroupedHistory = (closedPos) => {
+const HISTORY_SOURCE_ORDER = ['Auto Paper Trades', 'Manual Paper Trades', 'Live Broker Trades'];
+const HISTORY_CATEGORY_ORDER = ['Index Options', 'Futures', 'Crypto', 'Other Options'];
+const HISTORY_ASSET_ORDER = {
+  'Index Options': ['BNF', 'Nifty', 'Sensex'],
+  'Futures': ['BNF', 'Nifty', 'Sensex', 'Gold', 'Crudeoil'],
+  'Crypto': ['BTC', 'ETH', 'SOL'],
+};
+
+const isOptionContract = (symbol) => {
+  const sym = (symbol || '').toUpperCase();
+  return sym.endsWith(' CE') || sym.endsWith(' PE') || sym.includes(' CE') || sym.includes(' PE');
+};
+
+const getHistoryAssetLabel = (symbol) => {
+  const sym = (symbol || '').toUpperCase();
+  const base = getNormalizedBaseSymbol(symbol);
+  if (sym.includes('BTC')) return 'BTC';
+  if (sym.includes('ETH')) return 'ETH';
+  if (sym.includes('SOL')) return 'SOL';
+  if (base === 'BANKNIFTY') return 'BNF';
+  if (base === 'NIFTY') return 'Nifty';
+  if (base === 'SENSEX') return 'Sensex';
+  if (base === 'GOLD') return 'Gold';
+  if (base === 'CRUDEOIL') return 'Crudeoil';
+  return base || 'Other';
+};
+
+const getHistoryAssetGroup = (item) => {
+  const symbol = item.symbol || '';
+  const base = getNormalizedBaseSymbol(symbol);
+  const asset = getHistoryAssetLabel(symbol);
+  if (isCryptoAsset(symbol)) {
+    return { category: 'Crypto', asset };
+  }
+  if (isOptionContract(symbol)) {
+    if (['BANKNIFTY', 'NIFTY', 'SENSEX'].includes(base)) {
+      return { category: 'Index Options', asset };
+    }
+    return { category: 'Other Options', asset };
+  }
+  return { category: 'Futures', asset };
+};
+
+const getSortedKeys = (obj, preferredOrder = []) => {
+  return Object.keys(obj).sort((a, b) => {
+    const aIndex = preferredOrder.indexOf(a);
+    const bIndex = preferredOrder.indexOf(b);
+    if (aIndex !== -1 || bIndex !== -1) {
+      if (aIndex === -1) return 1;
+      if (bIndex === -1) return -1;
+      return aIndex - bIndex;
+    }
+    return a.localeCompare(b);
+  });
+};
+
+const getHistoryItems = (node) => {
+  const items = [];
+  Object.values(node || {}).forEach(value => {
+    if (Array.isArray(value)) {
+      items.push(...value);
+    } else if (value && typeof value === 'object') {
+      items.push(...getHistoryItems(value));
+    }
+  });
+  return items;
+};
+
+const getGroupedHistory = (historyPositions) => {
   const grouped = {};
-  closedPos.forEach(item => {
-    const exitDateStr = item.exit_time ? item.exit_time.split('T')[0] : 'Unknown Date';
+  historyPositions.forEach(item => {
     const source = getSourceGroup(item);
-    const sub = getSubgroup(item.symbol);
+    const { category, asset } = getHistoryAssetGroup(item);
     
-    if (!grouped[exitDateStr]) {
-      grouped[exitDateStr] = {};
+    if (!grouped[source]) {
+      grouped[source] = {};
     }
-    if (!grouped[exitDateStr][source]) {
-      grouped[exitDateStr][source] = {};
+    if (!grouped[source][category]) {
+      grouped[source][category] = {};
     }
-    if (!grouped[exitDateStr][source][sub]) {
-      grouped[exitDateStr][source][sub] = [];
+    if (!grouped[source][category][asset]) {
+      grouped[source][category][asset] = [];
     }
-    grouped[exitDateStr][source][sub].push(item);
+    grouped[source][category][asset].push(item);
+  });
+
+  Object.values(grouped).forEach(categoryGroups => {
+    Object.values(categoryGroups).forEach(assetGroups => {
+      Object.values(assetGroups).forEach(items => {
+        items.sort((a, b) => {
+          const aTime = new Date(a.exit_time || a.entry_time || 0).getTime();
+          const bTime = new Date(b.exit_time || b.entry_time || 0).getTime();
+          return bTime - aTime;
+        });
+      });
+    });
   });
   return grouped;
 };
@@ -666,6 +745,113 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
     });
   };
 
+  const renderHistoryPnL = (pnlData, textStyle = styles.subgroupPnL) => (
+    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+      {pnlData.inr !== 0 && (
+        <Text style={[textStyle, pnlData.inr > 0 ? styles.textProfit : (pnlData.inr < 0 ? styles.textLoss : styles.textNeutral)]}>
+          {`${pnlData.inr > 0 ? '+' : ''}\u20b9${pnlData.inr.toLocaleString('en-IN', {minimumFractionDigits: 2})}`}
+        </Text>
+      )}
+      {pnlData.usd !== 0 && (
+        <Text style={[textStyle, pnlData.usd > 0 ? styles.textProfit : (pnlData.usd < 0 ? styles.textLoss : styles.textNeutral)]}>
+          {`${pnlData.usd > 0 ? '+' : ''}$${pnlData.usd.toLocaleString('en-US', {minimumFractionDigits: 2})}`}
+        </Text>
+      )}
+    </View>
+  );
+
+  const renderHistoryByAsset = () => {
+    const groupedHistory = getGroupedHistory(filteredPositions);
+    const sortedSources = getSortedKeys(groupedHistory, HISTORY_SOURCE_ORDER);
+
+    return sortedSources.map(source => {
+      const sourceMeta = groupsData[source] || { label: source, accent: '#3b82f6' };
+      const isSourceCollapsed = !!collapsedSources[`history_${source}`];
+      const sourceItems = getHistoryItems(groupedHistory[source]);
+      const sourcePnL = calculatePnLSum(sourceItems);
+
+      return (
+        <View key={source} style={[styles.dateBlock, { borderColor: sourceMeta.accent + '25' }]}>
+          <TouchableOpacity
+            style={[styles.dateHeader, { backgroundColor: sourceMeta.accent + '0c', borderBottomColor: sourceMeta.accent + '1a' }]}
+            onPress={() => setCollapsedSources(prev => ({ ...prev, [`history_${source}`]: !prev[`history_${source}`] }))}
+          >
+            <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+              <Text style={{ fontSize: 13, color: sourceMeta.accent, fontWeight: 'bold', marginRight: 8 }}>
+                {isSourceCollapsed ? '>' : 'v'}
+              </Text>
+              <View style={[styles.dotIndicator, { backgroundColor: sourceMeta.accent }]} />
+              <Text style={styles.dateTitle} numberOfLines={1}>{sourceMeta.label}</Text>
+            </View>
+            {renderHistoryPnL(sourcePnL, styles.groupPnLText)}
+          </TouchableOpacity>
+
+          {!isSourceCollapsed && (
+            <View style={styles.dateContent}>
+              {getSortedKeys(groupedHistory[source], HISTORY_CATEGORY_ORDER).map(category => {
+                const categoryKey = `history_${source}_${category}`;
+                const isCategoryCollapsed = !!collapsedSubgroups[categoryKey];
+                const categoryItems = getHistoryItems(groupedHistory[source][category]);
+                const categoryPnL = calculatePnLSum(categoryItems);
+
+                return (
+                  <View key={category} style={styles.sourceWrapper}>
+                    <TouchableOpacity
+                      style={styles.sourceCollapseHeader}
+                      onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [categoryKey]: !prev[categoryKey] }))}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                        <Text style={{ fontSize: 11, color: '#9ca3af', marginRight: 6 }}>
+                          {isCategoryCollapsed ? '>' : 'v'}
+                        </Text>
+                        <Text style={styles.sourceCollapseTitle} numberOfLines={1}>{category}</Text>
+                      </View>
+                      {renderHistoryPnL(categoryPnL)}
+                    </TouchableOpacity>
+
+                    {!isCategoryCollapsed && (
+                      <View style={styles.sourceCollapseContent}>
+                        {getSortedKeys(groupedHistory[source][category], HISTORY_ASSET_ORDER[category] || []).map(asset => {
+                          const assetKey = `history_${source}_${category}_${asset}`;
+                          const isAssetCollapsed = !!collapsedSubgroups[assetKey];
+                          const assetItems = groupedHistory[source][category][asset];
+                          const assetPnL = calculatePnLSum(assetItems);
+
+                          return (
+                            <View key={asset} style={styles.subgroupWrapper}>
+                              <TouchableOpacity
+                                style={styles.subgroupCollapseHeader}
+                                onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [assetKey]: !prev[assetKey] }))}
+                              >
+                                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                                  <Text style={{ fontSize: 9, color: '#6b7280', marginRight: 6 }}>
+                                    {isAssetCollapsed ? '>' : 'v'}
+                                  </Text>
+                                  <Text style={styles.subgroupCollapseTitle} numberOfLines={1}>{asset}</Text>
+                                </View>
+                                {renderHistoryPnL(assetPnL)}
+                              </TouchableOpacity>
+
+                              {!isAssetCollapsed && (
+                                <View style={styles.subgroupCollapseContent}>
+                                  {assetItems.map(item => renderPositionCard(item))}
+                                </View>
+                              )}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    )}
+                  </View>
+                );
+              })}
+            </View>
+          )}
+        </View>
+      );
+    });
+  };
+
   return (
     <View style={[styles.container, isCompactLandscape && styles.containerCompact]}>
       {/* Top Combined Performance Stats Bar */}
@@ -771,7 +957,7 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
         {filteredPositions.length > 0 ? (
           activeTab === 'active' 
             ? Object.keys(groupsData).map(groupKey => renderSourceCardActive(groupKey))
-            : renderHistoryCollapsible()
+            : renderHistoryByAsset()
         ) : (
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>
