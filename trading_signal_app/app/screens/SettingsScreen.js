@@ -17,6 +17,16 @@ import {
 import { BACKEND_URL } from '../config';
 import { supabase } from '../supabase';
 
+const PURGE_SEGMENT_OPTIONS = [
+  { id: 'ALL', label: 'All' },
+  { id: 'INDEX_OPTIONS', label: 'Index Options' },
+  { id: 'CRYPTO_FUTURES', label: 'Crypto Futures' },
+  { id: 'MCX_GOLD', label: 'MCX Gold' },
+  { id: 'MCX_CRUDEOIL', label: 'MCX Crudeoil' },
+  { id: 'INDEX_FUTURES', label: 'Index Futures' },
+  { id: 'OTHER_OPTIONS', label: 'Other Options' },
+  { id: 'OTHER', label: 'Other' },
+];
 
 export default function SettingsScreen({ session, onLogout, onPurge }) {
   const [brokers, setBrokers] = useState([]);
@@ -31,6 +41,9 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
   const [flattradeClientId, setFlattradeClientId] = useState('');
   const [flattradeApiKey, setFlattradeApiKey] = useState('');
   const [flattradeApiSecret, setFlattradeApiSecret] = useState('');
+  const [purgeSegment, setPurgeSegment] = useState('ALL');
+  const [purgeStartDate, setPurgeStartDate] = useState('');
+  const [purgeEndDate, setPurgeEndDate] = useState('');
   const { width, height } = useWindowDimensions();
   const isLandscape = width > height;
 
@@ -234,9 +247,19 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
   };
 
   const handlePurgeData = () => {
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+    if ((purgeStartDate.trim() && !datePattern.test(purgeStartDate.trim())) || (purgeEndDate.trim() && !datePattern.test(purgeEndDate.trim()))) {
+      Alert.alert('Invalid date', 'Use YYYY-MM-DD for purge start and end dates.');
+      return;
+    }
+    const segmentLabel = PURGE_SEGMENT_OPTIONS.find(item => item.id === purgeSegment)?.label || purgeSegment;
+    const dateLabel = purgeStartDate.trim() || purgeEndDate.trim()
+      ? `${purgeStartDate.trim() || 'first trade'} to ${purgeEndDate.trim() || 'latest trade'}`
+      : 'all dates';
+
     Alert.alert(
       'Confirm Database Purge',
-      'This permanently deletes all signals and positions from the database.',
+      `This permanently deletes matching test data for ${segmentLabel} (${dateLabel}).`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -248,6 +271,11 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
               const response = await fetch(`${BACKEND_URL}/api/admin/purge-test-data`, {
                 method: 'POST',
                 headers: authHeaders(true),
+                body: JSON.stringify({
+                  segment: purgeSegment,
+                  start_date: purgeStartDate.trim() || null,
+                  end_date: purgeEndDate.trim() || null,
+                }),
               });
               const data = await response.json();
               if (!response.ok) {
@@ -481,9 +509,52 @@ export default function SettingsScreen({ session, onLogout, onPurge }) {
       </TouchableOpacity>
 
       <Text style={styles.sectionTitle}>Testing</Text>
-      <TouchableOpacity style={styles.dangerButton} onPress={handlePurgeData}>
-        <Text style={styles.dangerButtonText}>PURGE TEST DATA</Text>
-      </TouchableOpacity>
+      <View style={styles.card}>
+        <Text style={styles.inputLabel}>Purge Section</Text>
+        <View style={styles.segmentWrap}>
+          {PURGE_SEGMENT_OPTIONS.map(option => {
+            const isSelected = purgeSegment === option.id;
+            return (
+              <TouchableOpacity
+                key={option.id}
+                style={[styles.segmentChip, isSelected && styles.segmentChipActive]}
+                onPress={() => setPurgeSegment(option.id)}
+              >
+                <Text style={[styles.segmentChipText, isSelected && styles.segmentChipTextActive]}>{option.label}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        <View style={styles.dateRow}>
+          <View style={styles.dateField}>
+            <Text style={styles.inputLabel}>Start Date</Text>
+            <TextInput
+              style={styles.input}
+              value={purgeStartDate}
+              onChangeText={setPurgeStartDate}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor="#64748b"
+              keyboardType="numbers-and-punctuation"
+            />
+          </View>
+          <View style={styles.dateField}>
+            <Text style={styles.inputLabel}>End Date</Text>
+            <TextInput
+              style={styles.input}
+              value={purgeEndDate}
+              onChangeText={setPurgeEndDate}
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor="#64748b"
+              keyboardType="numbers-and-punctuation"
+            />
+          </View>
+        </View>
+
+        <TouchableOpacity style={styles.dangerButton} onPress={handlePurgeData}>
+          <Text style={styles.dangerButtonText}>PURGE MATCHING DATA</Text>
+        </TouchableOpacity>
+      </View>
     </ScrollView>
   );
 }
@@ -632,6 +703,40 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   dangerButtonText: { color: '#f87171', fontSize: 11, fontWeight: '700' },
+  segmentWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 8,
+  },
+  segmentChip: {
+    borderColor: '#273244',
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 9,
+    paddingVertical: 7,
+    marginRight: 7,
+    marginBottom: 7,
+    backgroundColor: '#0b111c',
+  },
+  segmentChipActive: {
+    borderColor: '#3b82f6',
+    backgroundColor: '#13223a',
+  },
+  segmentChipText: {
+    color: '#94a3b8',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  segmentChipTextActive: {
+    color: '#f8fafc',
+  },
+  dateRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  dateField: {
+    flex: 1,
+  },
   strategyRow: {
     flexDirection: 'row',
     alignItems: 'center',

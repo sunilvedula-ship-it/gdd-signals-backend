@@ -1,21 +1,24 @@
 import os
 import json
 import math
+import hashlib
+import secrets
 from datetime import datetime, date, time, timedelta
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 
-from backend.database import init_db, get_db, Signal, Position, DailyConsent, User
+from backend.database import init_db, get_db, Signal, Position, DailyConsent, User, AppAuthSession, BrokerOrder
 from backend.credentials import AppCredentialsManager, INDIAN_BROKERS, CRYPTO_EXCHANGES
 from backend.flattrade_client import place_flattrade_order, exchange_request_code
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 # Initialize FastAPI App
 app = FastAPI(title="GuruDevaDatta Trading App Backend", version="1.0.0")
+INTRADAY_SQUARE_OFF_TIME = time(15, 15)
 
 # Enable CORS for the local web simulator
 app.add_middleware(
@@ -71,6 +74,15 @@ class CredentialRequest(BaseModel):
     api_secret: str
     extra: Optional[dict] = None
 
+class TestLoginRequest(BaseModel):
+    phone: str
+    password: str
+
+class PurgeRequest(BaseModel):
+    segment: Optional[str] = "ALL"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
 # On startup, initialize DB
 @app.on_event("startup")
 def startup_event():
@@ -83,7 +95,7 @@ def startup_event():
         user.trial_end = get_ist_time() + timedelta(days=7)
         db.add(user)
         db.commit()
-    
+
     # Auto-insert daily consent for User 1 to make local webhook simulator work out-of-the-box
     ist_now = get_ist_time()
     today_str = ist_now.date().isoformat()
@@ -97,7 +109,7 @@ def startup_event():
         )
         db.add(consent)
         db.commit()
-        
+
     db.close()
 
 # Supabase Credentials & Token Validation Helpers
@@ -107,7 +119,7 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR
 def get_user_from_token(token: str) -> Optional[dict]:
     import urllib.request
     import json
-    
+
     url = f"{SUPABASE_URL}/auth/v1/user"
     req = urllib.request.Request(
         url,
@@ -128,7 +140,7 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     token = None
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header.split(" ")[1]
-        
+
     if not token:
         # Fallback to sandbox user (User ID 1) for local web simulator
         user = db.query(User).filter(User.id == 1).first()
@@ -144,17 +156,21 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
             db.commit()
             db.refresh(user)
         return user
-        
+
+    app_session_user = get_app_session_user(token, db)
+    if app_session_user:
+        return app_session_user
+
     # Verify token
     user_info = get_user_from_token(token)
     if not user_info:
         raise HTTPException(status_code=401, detail="Invalid session token. Please log in again.")
-        
+
     supabase_uid = user_info.get("id")
     email = user_info.get("email")
     phone = user_info.get("phone")
     name = user_info.get("user_metadata", {}).get("name", email or phone or "User")
-    
+
     user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
     if not user:
         # Check if user with same phone or email exists but has no supabase_uid
@@ -174,25 +190,123 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
             db.add(user)
         db.commit()
         db.refresh(user)
-        
+
     return user
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def normalize_phone_number(value: Optional[str]) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) == 10:
+        digits = f"91{digits}"
+    return f"+{digits}" if digits else ""
+
+def configured_admin_phone_numbers() -> set:
+    raw = os.environ.get("ADMIN_PHONE_NUMBERS", "+918919859974")
+    return {
+        normalize_phone_number(phone)
+        for phone in raw.split(",")
+        if normalize_phone_number(phone)
+    }
+
+def configured_test_login_phones() -> set:
+    raw = os.environ.get("TEST_LOGIN_PHONES", "+919043055445")
+    return {
+        normalize_phone_number(phone)
+        for phone in raw.split(",")
+        if normalize_phone_number(phone)
+    }
+
+def app_auth_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def get_app_session_user(token: str, db: Session) -> Optional[User]:
+    if not token or not token.startswith("appt_"):
+        return None
+    session_row = db.query(AppAuthSession).filter(
+        AppAuthSession.token_hash == app_auth_token_hash(token),
+        AppAuthSession.revoked_at.is_(None),
+        AppAuthSession.expires_at > get_ist_time(),
+    ).first()
+    if not session_row:
+        return None
+    return db.query(User).filter(User.id == session_row.user_id).first()
+
+def is_administrator(user: User) -> bool:
+    admin_emails = {
+        value.strip().lower()
+        for value in os.environ.get("ADMIN_EMAILS", "").split(",")
+        if value.strip()
+    }
+    is_local_admin = env_flag("ALLOW_SANDBOX_AUTH") and user.id == 1
+    is_email_admin = bool(user.email and user.email.lower() in admin_emails)
+    is_phone_admin = normalize_phone_number(user.phone) in configured_admin_phone_numbers()
+    return is_local_admin or is_email_admin or is_phone_admin
+
+@app.post("/api/auth/test-login")
+def test_login(req: TestLoginRequest, db: Session = Depends(get_db)):
+    if not env_flag("TEST_LOGIN_ENABLED", True):
+        raise HTTPException(status_code=403, detail="Test login is not enabled")
+
+    phone = normalize_phone_number(req.phone)
+    expected_password = os.environ.get("TEST_LOGIN_PASSWORD", "123456")
+    if phone not in configured_test_login_phones() or req.password != expected_password:
+        raise HTTPException(status_code=401, detail="Invalid test login")
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        user = User(
+            email=f"test-{phone.lstrip('+')}@local.gdd",
+            phone=phone,
+            name="Testing User",
+            subscription_status="active",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    token = f"appt_{secrets.token_urlsafe(48)}"
+    db.add(AppAuthSession(
+        user_id=user.id,
+        token_hash=app_auth_token_hash(token),
+        purpose="test_login",
+        expires_at=get_ist_time() + timedelta(days=30),
+        created_at=get_ist_time(),
+    ))
+    db.commit()
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 60 * 60 * 24 * 30,
+        "user": {
+            "id": user.id,
+            "phone": user.phone,
+            "name": user.name,
+            "test_account": True,
+        },
+    }
 
 def get_base_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
     if ":" in s:
         s = s.split(":")[-1]
-    
+
     # Check if option symbol
     parse_res = parse_option_symbol(s)
     if parse_res.get("is_option"):
         underlying = parse_res["underlying"]
         return get_base_symbol(underlying)
-        
+
     if s.endswith("1!"):
         s = s[:-2]
     elif s.endswith("!"):
         s = s[:-1]
-        
+
     if "XAU" in s or "GOLD" in s:
         return "GOLD"
     if "SILVER" in s:
@@ -210,10 +324,10 @@ def get_base_symbol(symbol: str) -> str:
 def is_symbol_muted(symbol: str, muted_symbols_str: str) -> bool:
     if not muted_symbols_str:
         return False
-        
+
     target_base = get_base_symbol(symbol)
     muted_list = [get_base_symbol(s) for s in muted_symbols_str.split(",") if s.strip()]
-    
+
     return target_base in muted_list
 
 # Settings endpoints
@@ -237,7 +351,7 @@ def toggle_mute_symbol(req: MuteRequest, db: Session = Depends(get_db), user: Us
         sym = sym[:-2]
     elif sym.endswith("!"):
         sym = sym[:-1]
-        
+
     if "XAUUSD" in sym or "XAU" in sym or "GOLD" in sym:
         sym = "GOLD"
     elif "SILVER" in sym:
@@ -250,14 +364,14 @@ def toggle_mute_symbol(req: MuteRequest, db: Session = Depends(get_db), user: Us
         sym = "SENSEX"
     elif "CRUDE" in sym:
         sym = "CRUDEOIL"
-        
+
     if req.mute:
         if sym not in muted_list:
             muted_list.append(sym)
     else:
         if sym in muted_list:
             muted_list.remove(sym)
-            
+
     user.muted_symbols = ",".join(muted_list)
     db.commit()
     return {"status": "success", "muted_symbols": muted_list}
@@ -289,7 +403,32 @@ def parse_option_symbol(symbol: str) -> dict:
     s = symbol.upper().strip()
     if ":" in s:
         s = s.split(":")[-1]
-        
+    if s.startswith("OPTIDX_"):
+        s = s[len("OPTIDX_"):]
+
+    match_optidx = re.match(r'^([A-Z]+)_([0-9]{1,2}[A-Z]{3}[0-9]{4})_(CE|PE)_(\d+(?:\.\d+)?)$', s)
+    if match_optidx:
+        underlying = match_optidx.group(1)
+        expiry_str = match_optidx.group(2)
+        opt_type = match_optidx.group(3)
+        strike = int(float(match_optidx.group(4)))
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%d%b%Y").date()
+        except Exception:
+            expiry_date = None
+        if underlying in ["BNF", "BANKNIFTY"]:
+            underlying = "BANKNIFTY"
+        elif underlying in ["BSX", "SENSEX"]:
+            underlying = "SENSEX"
+        return {
+            "is_option": True,
+            "underlying": underlying,
+            "expiry_date": expiry_date,
+            "strike": strike,
+            "opt_type": opt_type,
+            "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
+        }
+
     # Format 1: Space separated with explicit expiry e.g. NIFTY 09JUN26 23500 CE
     match_space = re.match(r'^([A-Z]+)\s+([0-9A-Z]{6,7})\s+(\d+)\s+(CE|PE)$', s)
     if match_space:
@@ -297,7 +436,7 @@ def parse_option_symbol(symbol: str) -> dict:
         expiry_str = match_space.group(2)
         strike = int(match_space.group(3))
         opt_type = match_space.group(4)
-        
+
         # Parse expiry date
         expiry_date = None
         try:
@@ -307,14 +446,14 @@ def parse_option_symbol(symbol: str) -> dict:
                 expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
             except Exception:
                 pass
-                
+
         if underlying in ["BNF", "BANKNIFTY"]:
             underlying = "BANKNIFTY"
         elif underlying in ["NIFTY"]:
             underlying = "NIFTY"
         elif underlying in ["BSX", "SENSEX"]:
             underlying = "SENSEX"
-            
+
         return {
             "is_option": True,
             "underlying": underlying,
@@ -323,21 +462,21 @@ def parse_option_symbol(symbol: str) -> dict:
             "opt_type": opt_type,
             "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
         }
-        
+
     # Format 2: Space separated without expiry (fallback ATM calculation) e.g. BANKNIFTY 54400 CE
     match_no_expiry = re.match(r'^([A-Z]+)\s+(\d+)\s+(CE|PE)$', s)
     if match_no_expiry:
         underlying = match_no_expiry.group(1)
         strike = int(match_no_expiry.group(2))
         opt_type = match_no_expiry.group(3)
-        
+
         if underlying in ["BNF", "BANKNIFTY"]:
             underlying = "BANKNIFTY"
         elif underlying in ["NIFTY"]:
             underlying = "NIFTY"
         elif underlying in ["BSX", "SENSEX"]:
             underlying = "SENSEX"
-            
+
         return {
             "is_option": True,
             "underlying": underlying,
@@ -354,7 +493,7 @@ def parse_option_symbol(symbol: str) -> dict:
         expiry_str = match_nse.group(2)
         opt_char = match_nse.group(3)
         strike = int(match_nse.group(4))
-        
+
         expiry_date = None
         try:
             expiry_date = datetime.strptime(expiry_str, "%d%b%y").date()
@@ -363,14 +502,14 @@ def parse_option_symbol(symbol: str) -> dict:
                 expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
             except Exception:
                 pass
-                
+
         if underlying in ["BNF", "BANKNIFTY"]:
             underlying = "BANKNIFTY"
         elif underlying in ["NIFTY"]:
             underlying = "NIFTY"
         elif underlying in ["BSX", "SENSEX"]:
             underlying = "SENSEX"
-            
+
         opt_type = "CE" if opt_char == "C" else "PE"
         return {
             "is_option": True,
@@ -380,7 +519,7 @@ def parse_option_symbol(symbol: str) -> dict:
             "opt_type": opt_type,
             "formatted_symbol": f"{underlying} {expiry_date.strftime('%d%b%y').upper() if expiry_date else ''} {strike} {opt_type}"
         }
-        
+
     # Format 4: BSE compact format e.g. SENSEX2660474800CE
     match_bse = re.match(r'^([A-Z]+)(\d{2})(10|11|12|[1-9]|[OND])(\d{2})(\d+)(CE|PE)$', s)
     if match_bse:
@@ -390,11 +529,11 @@ def parse_option_symbol(symbol: str) -> dict:
         day_str = match_bse.group(4)
         strike = int(match_bse.group(5))
         opt_type = match_bse.group(6)
-        
+
         # Parse expiry date
         year = 2000 + int(year_str)
         day = int(day_str)
-        
+
         if month_str.isdigit():
             month = int(month_str)
         else:
@@ -403,19 +542,19 @@ def parse_option_symbol(symbol: str) -> dict:
             elif m_char == "N": month = 11
             elif m_char == "D": month = 12
             else: month = 1
-            
+
         try:
             expiry_date = date(year, month, day)
         except Exception:
             expiry_date = None
-            
+
         if underlying in ["BNF", "BANKNIFTY"]:
             underlying = "BANKNIFTY"
         elif underlying in ["NIFTY"]:
             underlying = "NIFTY"
         elif underlying in ["BSX", "SENSEX"]:
             underlying = "SENSEX"
-            
+
         return {
             "is_option": True,
             "underlying": underlying,
@@ -449,7 +588,7 @@ def get_next_monthly_expiry(ist_now: datetime, weekday: int = 1) -> date:
     curr_month_expiry = get_last_weekday_of_month(ist_now.year, ist_now.month, weekday)
     is_today_expiry = ist_now.date() == curr_month_expiry
     is_past_expiry = ist_now.date() > curr_month_expiry or (is_today_expiry and ist_now.time() > time(15, 30))
-    
+
     if is_past_expiry:
         if ist_now.month == 12:
             next_year = ist_now.year + 1
@@ -471,7 +610,7 @@ def get_time_to_expiry_years(underlying: str, expiry_date: Optional[date] = None
             expiry_date = get_next_weekly_expiry(ist_now, 3)
         else:
             expiry_date = get_next_weekly_expiry(ist_now, 1)
-        
+
     expiry_datetime = datetime.combine(expiry_date, time(15, 30))
     diff = expiry_datetime - ist_now
     diff_seconds = diff.total_seconds()
@@ -485,13 +624,13 @@ def black_scholes_option_price(S: float, K: float, T: float, r: float, sigma: fl
             return max(0.0, S - K)
         else:
             return max(0.0, K - S)
-            
+
     d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
-    
+
     def N(x):
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-        
+
     if option_type == "CE":
         price = S * N(d1) - K * math.exp(-r * T) * N(d2)
     else:
@@ -513,21 +652,21 @@ def calculate_option_price_bs(underlying: str, strike: float, opt_type: str, liv
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
     s = symbol.upper().strip()
-    
+
     # Check if option symbol first
     parse_res = parse_option_symbol(s)
     if parse_res.get("is_option"):
         return parse_res["formatted_symbol"]
-        
+
     # Strip TV futures suffixes
     if s.endswith("1!"):
         s = s[:-2]
     elif s.endswith("!"):
         s = s[:-1]
-    
+
     if ":" in s:
         s = s.split(":")[-1]
-        
+
     if "XAUUSD" in s or "XAU" in s or "GOLD" in s:
         return "GOLD"
     if "SILVER" in s:
@@ -549,22 +688,24 @@ def extract_strike_from_symbol(symbol: str) -> Optional[float]:
         return float(parse_res["strike"])
     return None
 
-def close_position_entry(pos: Position, index_exit_price: float, db: Session) -> float:
+def close_position_entry(pos: Position, index_exit_price: float, db: Session, reason: Optional[str] = None) -> float:
     parse_res = parse_option_symbol(pos.symbol)
-    
+    if reason:
+        pos.exit_reason = reason
+
     if parse_res.get("is_option"):
         underlying = parse_res["underlying"]
         opt_type = parse_res["opt_type"]
         strike = parse_res["strike"]
         expiry_date = parse_res.get("expiry_date")
-        
+
         if index_exit_price > 0 and index_exit_price < 0.2 * strike:
             exit_price = index_exit_price
         else:
             exit_price = calculate_option_price_bs(underlying, strike, opt_type, index_exit_price, expiry_date=expiry_date)
     else:
         exit_price = index_exit_price
-        
+
     if pos.real_or_paper.upper() == "LIVE":
         from backend.credentials import AppCredentialsManager
         mgr = AppCredentialsManager(db, user_id=pos.user_id)
@@ -582,20 +723,20 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session) ->
             )
             if res.get("status") == "error":
                 raise Exception(res.get("message"))
-        
+
     pos.exit_price = round(exit_price, 2)
     pos.exit_time = get_ist_time()
     pos.status = "CLOSED"
-    
+
     if pos.direction == "LONG":
         pos.pnl = round((pos.exit_price - pos.entry_price) * pos.qty, 2)
     else:
         pos.pnl = round((pos.entry_price - pos.exit_price) * pos.qty, 2)
-        
+
     return pos.pnl
 
 
-def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, 
+def open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session,
                         user_id: int = 1, timeframe: str = "5m", real_or_paper: str = "PAPER", trade_type: str = "INTRADAY") -> Position:
     if real_or_paper.upper() == "LIVE":
         from backend.credentials import AppCredentialsManager
@@ -613,7 +754,7 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
             )
             if res.get("status") == "error":
                 raise Exception(res.get("message"))
-                
+
     new_pos = Position(
         user_id=user_id,
         symbol=symbol,
@@ -629,7 +770,7 @@ def open_position_entry(symbol: str, direction: str, entry_price: float, qty: fl
     db.add(new_pos)
     return new_pos
 
-def safe_open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session, 
+def safe_open_position_entry(symbol: str, direction: str, entry_price: float, qty: float, db: Session,
                              user_id: int, timeframe: str, real_or_paper: str, trade_type: str, trade_log: list, success_msg: str):
     try:
         open_position_entry(symbol, direction, entry_price, qty, db, user_id=user_id, timeframe=timeframe, real_or_paper=real_or_paper, trade_type=trade_type)
@@ -637,12 +778,129 @@ def safe_open_position_entry(symbol: str, direction: str, entry_price: float, qt
     except Exception as ex:
         trade_log.append(f"User {user_id}: Failed to open {direction} position for {symbol} in {real_or_paper} mode: {ex}")
 
-def safe_close_position_entry(pos: Position, index_exit_price: float, db: Session, trade_log: list, success_msg_template: str):
+def safe_close_position_entry(pos: Position, index_exit_price: float, db: Session, trade_log: list, success_msg_template: str, reason: Optional[str] = "SIGNAL_EXIT"):
     try:
-        pnl = close_position_entry(pos, index_exit_price, db)
+        pnl = close_position_entry(pos, index_exit_price, db, reason=reason)
         trade_log.append(success_msg_template.format(pnl=pnl, exit_price=pos.exit_price))
     except Exception as ex:
         trade_log.append(f"User {pos.user_id}: Failed to close {pos.direction} position on {pos.symbol} in {pos.real_or_paper} mode: {ex}")
+
+def parse_float_value(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+def extract_option_price_from_payload(payload: dict, action_norm: str) -> Optional[float]:
+    exit_keys = [
+        "exit_option_price", "exitOptionPrice", "option_exit_price",
+        "optionExitPrice", "exit_premium", "exitPremium",
+    ]
+    entry_keys = [
+        "entry_option_price", "entryOptionPrice", "option_entry_price",
+        "optionEntryPrice", "entry_premium", "entryPremium",
+    ]
+    common_keys = ["option_price", "optionPrice", "option_ltp", "optionLtp", "premium", "ltp"]
+    keys = exit_keys + common_keys if action_norm in {"EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"} else entry_keys + common_keys
+
+    for key in keys:
+        if key in payload:
+            parsed_price = parse_float_value(payload.get(key))
+            if parsed_price is not None and parsed_price > 0:
+                return parsed_price
+    return None
+
+def infer_target_exit_action(raw_direction, raw_action, raw_key, body_str: str) -> str:
+    context = " ".join([
+        str(raw_direction or ""),
+        str(raw_action or ""),
+        str(raw_key or ""),
+        str(body_str or ""),
+    ]).upper()
+    if re.search(r"\b(LONG|CE)\b", context):
+        return "EXIT_LONG"
+    if re.search(r"\b(SHORT|PE)\b", context):
+        return "EXIT_SHORT"
+    return "EXIT"
+
+def get_position_exit_input_price(pos: Position, fallback_price: float, payload_option_price: Optional[float]) -> float:
+    if payload_option_price is not None and parse_option_symbol(pos.symbol).get("is_option"):
+        return payload_option_price
+    return fallback_price
+
+def get_position_underlying(pos: Position) -> str:
+    parsed = parse_option_symbol(pos.symbol)
+    if parsed.get("is_option"):
+        return parsed["underlying"]
+    return normalize_symbol(pos.symbol)
+
+def ensure_cutoff_exit_signal(pos: Position, db: Session, now: datetime) -> None:
+    entry_signal = db.query(Signal).filter(Signal.id == pos.signal_id).first() if pos.signal_id else None
+    signal_symbol = entry_signal.symbol if entry_signal else get_position_underlying(pos)
+    day_start = datetime.combine(now.date(), time.min)
+    existing = db.query(Signal).filter(
+        Signal.symbol == signal_symbol,
+        Signal.action == "EXIT",
+        Signal.source_name == "SYSTEM_INTRADAY_CUTOFF",
+        Signal.timestamp >= day_start,
+    ).first()
+    if existing:
+        return
+
+    db.add(Signal(
+        symbol=signal_symbol,
+        action="EXIT",
+        price=pos.exit_price or pos.entry_price,
+        source="SYSTEM",
+        source_name="SYSTEM_INTRADAY_CUTOFF",
+        raw_payload=json.dumps({"reason": "INTRADAY_CUTOFF", "position_id": pos.id}),
+        timestamp=now,
+        timeframe=pos.timeframe or "5m",
+        trade_type="INTRADAY",
+    ))
+
+def square_off_expired_intraday_positions(db: Session, now: Optional[datetime] = None) -> dict:
+    current = now or get_ist_time()
+    candidates = db.query(Position).filter(Position.status.in_(["OPEN", "PARTIAL"])).all()
+    positions = [
+        pos for pos in candidates
+        if str(pos.trade_type or "INTRADAY").upper() == "INTRADAY"
+        and pos.entry_time
+        and (
+            pos.entry_time.date() < current.date()
+            or (pos.entry_time.date() == current.date() and current.time() >= INTRADAY_SQUARE_OFF_TIME)
+        )
+    ]
+
+    closed_ids = []
+    pending_ids = []
+    errors = []
+    for pos in positions:
+        if str(pos.real_or_paper or "PAPER").upper() == "LIVE" and not env_flag("LIVE_TRADING_ENABLED"):
+            errors.append({"position_id": pos.id, "error": "Live trading is disabled"})
+            continue
+
+        underlying = get_position_underlying(pos)
+        exit_price = get_live_market_price(underlying)
+        if exit_price is None:
+            latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
+            exit_price = latest_signal.price if latest_signal else pos.entry_price
+
+        try:
+            close_position_entry(pos, float(exit_price), db, reason="INTRADAY_CUTOFF")
+            ensure_cutoff_exit_signal(pos, db, current)
+            if pos.status == "CLOSED":
+                closed_ids.append(pos.id)
+            else:
+                pending_ids.append(pos.id)
+        except Exception as exc:
+            errors.append({"position_id": pos.id, "error": str(exc)})
+
+    if closed_ids or pending_ids:
+        db.commit()
+    return {"closed_position_ids": closed_ids, "pending_position_ids": pending_ids, "errors": errors}
 
 # Helper to determine qty and lot size based on symbol rules
 def calculate_trade_qty(symbol: str) -> float:
@@ -679,7 +937,7 @@ def calculate_option_premium(symbol: str, index_price: float) -> float:
     # Monthly indices: BANKNIFTY, BNF
     is_weekly = "NIFTY" in sym or "SENSEX" in sym or "BSX" in sym
     is_banknifty = "BANKNIFTY" in sym or "BNF" in sym
-    
+
     if is_banknifty:
         return round(index_price * 0.021, 2)      # 2.1% of index value standard (matches ~1124 premium at 54400 strike)
     elif is_weekly:
@@ -698,9 +956,9 @@ def calculate_option_premium(symbol: str, index_price: float) -> float:
 async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8", errors="ignore").strip()
-    
+
     print(f"[Webhook Request] Received: Path={request.url.path}, Method={request.method}, QueryParams={dict(request.query_params)}, Body='{body_str}'")
-    
+
     payload = {}
     if body_str:
         try:
@@ -713,16 +971,16 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 payload = {k: v[0] for k, v in parsed.items()}
             except Exception:
                 pass
-    
+
     # Merge query parameters (gives query params priority or fallback)
     for k, v in request.query_params.items():
         payload[k] = v
-        
+
     # 1. Resolve Auth Secret (Query, Header or Body)
     auth_token = payload.get("secret") or payload.get("auth") or payload.get("auth-token")
     if not auth_token:
         auth_token = request.headers.get("x-webhook-secret")
-        
+
     # Load secrets dynamically from environment (comma-separated) or fallback to defaults
     env_secrets = os.environ.get("VALID_SECRETS")
     if env_secrets:
@@ -739,7 +997,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     if not auth_token or auth_token not in VALID_SECRETS:
         print(f"[Webhook Error] Unauthorized auth token: '{auth_token}' in payload: {payload}")
         raise HTTPException(status_code=401, detail="Unauthorized webhook source")
-        
+
     # 2. Resolve Symbol
     symbol = payload.get("symbol") or payload.get("ticker")
     if not symbol and body_str:
@@ -751,9 +1009,9 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     if not symbol:
         # Fallback default to prevent 400 bad request error for empty alerts
         symbol = "BTCUSD"
-            
+
     symbol_norm = normalize_symbol(symbol)
-    
+
     # Resolve Timeframe
     raw_timeframe = payload.get("timeframe") or payload.get("interval")
     if raw_timeframe:
@@ -762,15 +1020,12 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             timeframe_str = f"{timeframe_str}m"
     else:
         timeframe_str = "5m"
-        
+
     # Resolve Trade Type (INTRADAY or POSITIONAL)
     raw_trade_type = payload.get("trade_type") or payload.get("type") or payload.get("style")
-    if raw_trade_type:
+    if raw_trade_type and str(raw_trade_type).strip().upper() in ["INTRADAY", "POSITIONAL"]:
         trade_type_str = str(raw_trade_type).strip().upper()
-        if trade_type_str in ["INTRADAY", "POSITIONAL"]:
-            trade_type_val = trade_type_str
-        else:
-            trade_type_val = "POSITIONAL" if "POSITIONAL" in trade_type_str else "INTRADAY"
+        trade_type_val = trade_type_str
     else:
         # Infer from ALL available context: source_name, orderId, signal_type, source, and raw body
         # resolved source_name is computed later, so compute it inline here too
@@ -790,19 +1045,19 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             trade_type_val = "INTRADAY"
         else:
             trade_type_val = "INTRADAY"
-    
+
     print(f"[Webhook] trade_type resolved to '{trade_type_val}' | raw_trade_type={raw_trade_type} | orderId={payload.get('orderId')} | signal_type={payload.get('signal_type')} | timeframe={timeframe_str}")
-    
+
     # 3. Resolve Price
     price = payload.get("price") or payload.get("signal_price")
     price_val = None
-    
+
     if price is not None:
         try:
             price_val = float(price)
         except (ValueError, TypeError):
             pass
-            
+
     is_json = False
     if body_str:
         try:
@@ -810,7 +1065,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             is_json = True
         except Exception:
             pass
-            
+
     if price_val is None and not is_json and body_str:
         # Search for a decimal/float number in the plain text body
         import re
@@ -820,7 +1075,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 price_val = float(numbers[0])
             except ValueError:
                 pass
-                
+
     # If still no price found or resolves to 0.0, fetch from live TradingView price feed
     if price_val is None or price_val == 0.0:
         live_price = get_live_market_price(symbol_norm)
@@ -828,17 +1083,21 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             price_val = live_price
         else:
             price_val = 0.0
-        
+
     # 4. Resolve Action
     raw_action = payload.get("action")
     raw_key = payload.get("key")
     raw_dir = payload.get("direction")
-    
+
     action_norm = "EXIT" # Default fallback
-    
+    is_target_hit = False
+
     if raw_action:
-        act_lower = str(raw_action).lower()
-        if act_lower in ["exit_long", "exitlong"]:
+        act_lower = str(raw_action).lower().strip()
+        is_target_hit = ("target" in act_lower and "hit" in act_lower) or act_lower in ["tp", "take profit", "target"]
+        if is_target_hit:
+            action_norm = infer_target_exit_action(raw_dir, raw_action, raw_key, body_str)
+        elif act_lower in ["exit_long", "exitlong"]:
             action_norm = "EXIT_LONG"
         elif act_lower in ["exit_short", "exitshort", "cover"]:
             action_norm = "EXIT_SHORT"
@@ -879,11 +1138,11 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 search_text = str(payload["text"])
             elif "message" in payload:
                 search_text = str(payload["message"])
-                
+
         if search_text:
             text_upper = search_text.upper()
             import re
-            
+
             # 1. Precise Word Boundary Checks
             if re.search(r"\bEXIT_LONG\b", text_upper) or re.search(r"\bSELLALERT\b", text_upper) or re.search(r"\bSELL_ALERT\b", text_upper) or re.search(r"\bEXIT\s+LONG\b", text_upper) or re.search(r"\bSELL\s+ALERT\b", text_upper):
                 action_norm = "EXIT_LONG"
@@ -897,7 +1156,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 action_norm = "LONG"
             elif re.search(r"\bSHORT\b", text_upper) or re.search(r"\bSELL\b", text_upper):
                 action_norm = "SHORT"
-                
+
             # 2. Fallback to Substring Checks
             else:
                 if "EXIT_LONG" in text_upper or "SELLALERT" in text_upper or "SELL_ALERT" in text_upper:
@@ -913,8 +1172,10 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                     action_norm = "SHORT"
                 elif "EXIT" in text_upper:
                     action_norm = "EXIT"
-            
-            
+
+
+    payload_option_price = extract_option_price_from_payload(payload, action_norm)
+
     # Resolve source
     source = payload.get("source") or ("TradingView" if (raw_key or "tradingview" in body_str.lower()) else "Scanner")
     source_name = payload.get("orderId") or payload.get("signal_type") or "Webhook Strategy Alert"
@@ -937,7 +1198,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     today_str = ist_now.date().isoformat()
     consent = db.query(DailyConsent).filter(DailyConsent.date == today_str).first()
     consent_signed = consent is not None and consent.consent_given
-    
+
     # Process Paper Trade
     # Normalize underlying symbol for options checking
     underlying_norm = symbol_norm
@@ -947,22 +1208,22 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         underlying_norm = "NIFTY"
     elif "SENSEX" in underlying_norm or "BSX" in underlying_norm:
         underlying_norm = "SENSEX"
-        
+
     # Check if this is a futures alert using the raw symbol and context
     raw_sym = str(symbol or "").upper().strip()
     raw_id = str(payload.get("orderId") or "").upper()
     raw_type = str(payload.get("signal_type") or "").upper()
     body_upper = str(body_str or "").upper()
-    
+
     is_crypto_or_commodity = (
-        raw_sym in ["GOLD", "CRUDEOIL", "BTCUSD", "ETHUSD", "SOLUSD"] or 
-        "BTC" in raw_sym or 
-        "ETH" in raw_sym or 
+        raw_sym in ["GOLD", "CRUDEOIL", "BTCUSD", "ETHUSD", "SOLUSD"] or
+        "BTC" in raw_sym or
+        "ETH" in raw_sym or
         "SOL" in raw_sym
     )
     is_futures_alert = (
-        "1!" in raw_sym or 
-        "FUT" in raw_sym or 
+        "1!" in raw_sym or
+        "FUT" in raw_sym or
         "FUTURES" in raw_sym or
         "FUT" in raw_id or
         "FUTURES" in raw_id or
@@ -972,26 +1233,28 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         "FUTURES" in body_upper or
         is_crypto_or_commodity
     )
-        
+
     # Calculate Option details (At-The-Money CE/PE option contract)
     has_options = underlying_norm in ["NIFTY", "BANKNIFTY", "SENSEX"]
     opt_strike = None
     opt_symbol = None
     opt_premium = None
     opt_type = None
-    
+
     # Check if the incoming signal is directly on an Option contract
     parse_res = parse_option_symbol(symbol_norm)
     is_option_signal = parse_res.get("is_option", False)
-    
+
     if is_option_signal:
         opt_symbol = parse_res["formatted_symbol"]
         opt_strike = parse_res["strike"]
         opt_type = parse_res["opt_type"]
         expiry_date = parse_res.get("expiry_date")
-        
+
+        if payload_option_price is not None:
+            opt_premium = payload_option_price
         # If the price in payload is at the scale of an option premium
-        if price_val > 0 and price_val < 0.2 * opt_strike:
+        elif price_val > 0 and price_val < 0.2 * opt_strike:
             opt_premium = price_val
         else:
             # Price is index price or 0. Fetch index price and calculate BS premium
@@ -1001,12 +1264,12 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     elif has_options and price_val > 0:
         step = 50 if underlying_norm == "NIFTY" else 100
         opt_strike = int(round(price_val / step) * step)
-        
+
         if action_norm in ["BUY", "LONG"]:
             opt_type = "CE"
         elif action_norm in ["SELL", "SHORT"]:
             opt_type = "PE"
-                
+
         if opt_type:
             # Determine expiry date
             if underlying_norm == "BANKNIFTY":
@@ -1017,10 +1280,10 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 expiry_date = get_next_weekly_expiry(ist_now, 3)
             else:
                 expiry_date = get_next_weekly_expiry(ist_now, 1)
-                
-            opt_premium = calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
+
             opt_symbol = f"{underlying_norm} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-            
+            opt_premium = payload_option_price if payload_option_price is not None else calculate_option_price_bs(underlying_norm, opt_strike, opt_type, price_val, expiry_date=expiry_date)
+
     # Check for open positions on this symbol or its options
     # Save signal in database in IST
     signal_entry = Signal(
@@ -1036,19 +1299,20 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     )
     db.add(signal_entry)
     db.commit()
-    
+
     trade_log = []
-    
+
     # 5. Process execution for all users
     today_str = ist_now.date().isoformat()
     users = db.query(User).all()
     processed_users_count = 0
-    
+
     for user in users:
         mgr = AppCredentialsManager(db, user_id=user.id)
         active_broker = mgr.get_active_broker()
-        mode_val = "LIVE" if active_broker else "PAPER"
-        
+        auto_mode = os.environ.get("WEBHOOK_AUTO_EXECUTION_MODE", "PAPER").strip().upper()
+        mode_val = "LIVE" if auto_mode == "LIVE" and active_broker and env_flag("LIVE_TRADING_ENABLED") else "PAPER"
+
         # Daily consent is only required for LIVE mode users
         if mode_val == "LIVE":
             consent = db.query(DailyConsent).filter(
@@ -1059,27 +1323,27 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
             if not consent:
                 print(f"[Webhook Skipped] User ID: {user.id} ({user.name}) is in LIVE mode but has not signed daily consent for today ({today_str})")
                 continue
-                
+
         print(f"[Webhook Processing] User ID: {user.id}, Name: {user.name}, Mode: {mode_val}")
-            
+
         if is_symbol_muted(symbol_norm, user.muted_symbols):
             print(f"[Webhook Skipped] Symbol {symbol_norm} is muted for User {user.id} ({user.name})")
             continue
-            
+
         # Check for open positions on this symbol or its options for this user
         # Scoped to same trade_type so INTRADAY and POSITIONAL coexist independently
         user_open_positions = db.query(Position).filter(
             Position.user_id == user.id,
-            ((Position.symbol == symbol_norm) | 
+            ((Position.symbol == symbol_norm) |
              (Position.symbol == underlying_norm) |
              (Position.symbol.like(f"{symbol_norm} %")) |
              (Position.symbol.like(f"{underlying_norm} %"))),
             Position.status == "OPEN",
             Position.trade_type == trade_type_val
         ).all()
-        
+
         open_pos_future = next((p for p in user_open_positions if p.symbol == symbol_norm), None)
-        
+
         user_action = action_norm
         # Contextual Exit Action Labels (SELL & COVER instead of EXIT)
         if user_action == "EXIT" and open_pos_future:
@@ -1087,7 +1351,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 user_action = "SELL"
             else:
                 user_action = "COVER"
-                
+
         # Execution Logic for this user
         if user_action in ["BUY", "LONG"]:
             is_explicit_long_entry = (
@@ -1097,14 +1361,22 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 "LONG" in str(raw_dir).upper() or
                 (str(raw_action).lower() == "buy" and not open_pos_future)
             )
-            
+
             if user_open_positions:
                 for p in user_open_positions:
-                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
-                
+                    exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
+                    safe_close_position_entry(
+                        p,
+                        exit_input_price,
+                        db,
+                        trade_log,
+                        "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})",
+                        reason="TARGET_HIT" if is_target_hit else "SIGNAL_EXIT",
+                    )
+
                 if not is_explicit_long_entry:
                     trade_log.append(f"User {user.id}: Covered SHORT position on {symbol_norm} (flat)")
-                    
+
             if not user_open_positions or is_explicit_long_entry:
                 if is_futures_alert:
                     # Open Future position
@@ -1123,7 +1395,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
                             safe_open_position_entry(symbol_norm, "LONG", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future LONG position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
-                    
+
         elif user_action in ["SELL", "SHORT"]:
             is_explicit_short_entry = (
                 raw_action is None or
@@ -1132,14 +1404,22 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                 "SHORT" in str(raw_dir).upper() or
                 (str(raw_action).lower() == "sell" and not open_pos_future)
             )
-            
+
             if user_open_positions:
                 for p in user_open_positions:
-                    safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})")
-                
+                    exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
+                    safe_close_position_entry(
+                        p,
+                        exit_input_price,
+                        db,
+                        trade_log,
+                        "User " + str(user.id) + ": Closed existing " + p.direction + " position on " + p.symbol + " (P&L: {pnl})",
+                        reason="TARGET_HIT" if is_target_hit else "SIGNAL_EXIT",
+                    )
+
                 if not is_explicit_short_entry:
                     trade_log.append(f"User {user.id}: Exited LONG position on {symbol_norm} (flat)")
-                    
+
             if not user_open_positions or is_explicit_short_entry:
                 if is_futures_alert:
                     # Open Future position
@@ -1158,27 +1438,37 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
                             # Fallback if options are not supported (e.g. stocks)
                             qty = calculate_trade_qty(symbol_norm)
                             safe_open_position_entry(symbol_norm, "SHORT", price_val, qty, db, user.id, timeframe_str, mode_val, trade_type_val, trade_log, f"User {user.id}: Opened Future SHORT position for {symbol_norm} (Qty: {qty}) in {mode_val} mode")
-                    
+
         elif user_action in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER"]:
             if user_open_positions:
                 for p in user_open_positions:
                     # Direction-aware exit check to prevent exit-ordering race conditions
                     should_close = False
+                    parsed_position = parse_option_symbol(p.symbol)
+                    option_type = parsed_position.get("opt_type") if parsed_position.get("is_option") else None
                     if user_action in ["EXIT", "CLOSE"]:
                         should_close = True
-                    elif user_action == "EXIT_LONG" and p.direction == "LONG":
+                    elif user_action == "EXIT_LONG" and p.direction == "LONG" and option_type != "PE":
                         should_close = True
-                    elif user_action in ["EXIT_SHORT", "COVER"] and p.direction == "SHORT":
+                    elif user_action in ["EXIT_SHORT", "COVER"] and (p.direction == "SHORT" or option_type == "PE"):
                         should_close = True
-                        
+
                     if should_close:
-                        safe_close_position_entry(p, price_val, db, trade_log, "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})")
+                        exit_input_price = get_position_exit_input_price(p, price_val, payload_option_price)
+                        safe_close_position_entry(
+                            p,
+                            exit_input_price,
+                            db,
+                            trade_log,
+                            "User " + str(user.id) + ": Exited " + p.direction + " position on " + p.symbol + " at {exit_price} (P&L: {pnl})",
+                            reason="TARGET_HIT" if is_target_hit else "SIGNAL_EXIT",
+                        )
             else:
                 trade_log.append(f"User {user.id}: Received exit signal for {symbol_norm} but no open position existed")
         processed_users_count += 1
-                
+
     db.commit()
-    
+
     # Broadcast signal and trades to all WS clients
     ws_data = {
         "event": "new_signal",
@@ -1197,12 +1487,13 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
         "logs": trade_log
     }
     await manager.broadcast(json.dumps(ws_data))
-    
+
     return {"status": "success", "processed_signals": processed_users_count, "actions": trade_log, "consent_signed": True}
 
 
 @app.get("/api/signals")
 def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    square_off_expired_intraday_positions(db)
     signals = db.query(Signal).order_by(Signal.timestamp.desc()).limit(limit).all()
     filtered_signals = [s for s in signals if not is_symbol_muted(s.symbol, user.muted_symbols)]
     return [{
@@ -1217,14 +1508,48 @@ def get_signals(limit: int = Query(50, ge=1, le=100), db: Session = Depends(get_
         "trade_type": s.trade_type or "INTRADAY"
     } for s in filtered_signals]
 
+def build_tradingview_option_ticker(symbol: str) -> Optional[str]:
+    parsed = parse_option_symbol(symbol)
+    if not parsed.get("is_option") or not parsed.get("expiry_date"):
+        return None
+    opt_char = "C" if parsed["opt_type"] == "CE" else "P"
+    expiry = parsed["expiry_date"].strftime("%y%m%d")
+    underlying = parsed["underlying"]
+    strike = int(parsed["strike"])
+    return f"NSE:{underlying}{expiry}{opt_char}{strike}"
+
+def pick_tradingview_price(values: list) -> Optional[float]:
+    for index in [0, 1, 2]:
+        try:
+            price = values[index]
+            if price is not None and float(price) > 0:
+                return float(price)
+        except (IndexError, TypeError, ValueError):
+            pass
+    try:
+        bid = values[3]
+        ask = values[4]
+        if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+            return (float(bid) + float(ask)) / 2.0
+    except (IndexError, TypeError, ValueError):
+        pass
+    return None
+
 def get_tradingview_price(symbol: str) -> Optional[float]:
     s = symbol.upper().strip()
-    
+
     # 1. Map to TradingView ticker and scanner market
     tv_ticker = None
     market = "global"
-    
-    if s in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
+    parsed_option = parse_option_symbol(s)
+    option_ticker = build_tradingview_option_ticker(s)
+    if parsed_option.get("is_option") and not option_ticker:
+        return None
+    if option_ticker:
+        tv_ticker = option_ticker
+        market = "global"
+
+    if not tv_ticker and s in ["NIFTY", "NIFTY1!", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY1!"]:
         tv_ticker = "NSE:NIFTY1!"
         market = "futures"
     elif s in ["BANKNIFTY", "BANKNIFTY1!", "NIFTYBANK", "NSE:BANKNIFTY", "NSE:BANKNIFTY1!"]:
@@ -1242,7 +1567,7 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
     elif s in ["CRUDE", "CRUDEOIL", "MCX:CRUDEOIL1!"]:
         tv_ticker = "MCX:CRUDEOIL1!"
         market = "futures"
-        
+
     if not tv_ticker:
         # Fallback mappings
         if "BTC" in s:
@@ -1268,9 +1593,9 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
             "tickers": [tv_ticker],
             "query": {"types": []}
         },
-        "columns": ["close"]
+        "columns": ["close", "lp", "last", "bid", "ask"]
     }
-    
+
     import urllib.request
     import json
     req = urllib.request.Request(
@@ -1282,13 +1607,13 @@ def get_tradingview_price(symbol: str) -> Optional[float]:
         },
         method="POST"
     )
-    
+
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             data_list = res_data.get("data", [])
             if data_list:
-                return float(data_list[0]["d"][0])
+                return pick_tradingview_price(data_list[0].get("d", []))
     except Exception as e:
         print(f"Error fetching TradingView price for {tv_ticker} on {market}: {e}")
     return None
@@ -1321,13 +1646,13 @@ def map_symbol_to_yahoo_ticker(symbol: str) -> str:
         return "SILVERBEES.NS"
     elif "CRUDE" in s_upper:
         return "CL=F"
-    
+
     # Fallback to other cryptos
     if s_upper.endswith("USD"):
         return f"{s_upper[:-3]}-USD"
     if s_upper.endswith("USDT"):
         return f"{s_upper[:-4]}-USD"
-        
+
     return f"{s_upper}.NS"
 
 def get_google_finance_price(ticker: str) -> Optional[float]:
@@ -1369,20 +1694,20 @@ PRICE_CACHE_TTL = 15 # seconds
 
 def get_live_market_price_data(symbol: str) -> dict:
     s_upper = symbol.upper().strip()
-    
+
     # Check cache
     now = datetime.utcnow()
     if s_upper in PRICE_CACHE:
         cached_val, cached_time = PRICE_CACHE[s_upper]
         if (now - cached_time).total_seconds() < PRICE_CACHE_TTL:
             return cached_val
-            
+
     # Check if known test/mock symbol to prevent long timeouts
     if "TEST" in s_upper or "MOCK" in s_upper or s_upper in ["DUMMY", "XYZ"]:
         res = {}
     else:
         res = _fetch_live_price_no_cache(s_upper)
-        
+
     PRICE_CACHE[s_upper] = (res, now)
     return res
 
@@ -1391,20 +1716,20 @@ def _fetch_live_price_no_cache(symbol: str) -> dict:
     price = get_tradingview_price(symbol)
     if price is not None:
         return {"price": price, "previous_close": None, "source": "TradingView"}
-        
+
     # 2. Try Google Finance (Backup Source)
     g_ticker = map_symbol_to_google_ticker(symbol)
     if g_ticker:
         price = get_google_finance_price(g_ticker)
         if price is not None:
             return {"price": price, "previous_close": None, "source": "GoogleFinance"}
-            
+
     # 3. Fallback to Yahoo Finance
     y_ticker = map_symbol_to_yahoo_ticker(symbol)
     y_data = get_yahoo_finance_price_data(y_ticker)
     if y_data:
         return {"price": y_data["price"], "previous_close": y_data.get("previous_close"), "source": "YahooFinance"}
-        
+
     return {}
 
 def get_live_market_price(symbol: str) -> Optional[float]:
@@ -1413,39 +1738,39 @@ def get_live_market_price(symbol: str) -> Optional[float]:
 
 def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
     s_upper = symbol.upper().strip()
-    
+
     # 1. Detect if the symbol is an Option contract
     parse_res = parse_option_symbol(symbol)
-    
+
     if parse_res.get("is_option"):
         underlying = parse_res["underlying"]
         opt_type = parse_res["opt_type"]
         strike = float(parse_res["strike"])
         expiry_date = parse_res.get("expiry_date")
-        
+
         # Get live underlying index price
         live_underlying = get_live_market_price(underlying)
         if live_underlying is None:
             # Fallback to latest signal price in database
             latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
             live_underlying = latest_signal.price if latest_signal else strike
-            
+
         current_premium = calculate_option_price_bs(underlying, strike, opt_type, live_underlying, expiry_date=expiry_date)
         return round(max(1.0, current_premium), 2)
-        
+
     # 2. Standard future/equity/crypto price resolution
     price_data = get_live_market_price_data(symbol)
-    
+
     if price_data:
         live_price = price_data["price"]
         source = price_data.get("source")
-        
+
         if source == "TradingView":
             return round(live_price, 2)
-            
+
         prev_close = price_data.get("previous_close")
         is_commodity_proxy = s_upper in ["GOLD1!", "GOLDM1!", "GOLD", "CRUDEOIL", "CRUDE", "SILVER"]
-        
+
         if is_commodity_proxy and prev_close and prev_close > 0:
             # Scale entry price by the proxy ETF/future daily percent change
             pct_change = (live_price - prev_close) / prev_close
@@ -1453,11 +1778,11 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
             return round(scaled_price, 2)
         else:
             return round(live_price, 2)
-            
+
     # Fallback to latest signal price in database
     latest_signal = db.query(Signal).filter(Signal.symbol == symbol).order_by(Signal.timestamp.desc()).first()
     price = latest_signal.price if latest_signal else entry_price
-    
+
     # Fallback simulated tick fluctuation
     import random
     fluctuation = random.uniform(-0.0015, 0.0015)
@@ -1466,35 +1791,135 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
 
 def is_usd_asset(symbol: str) -> bool:
     s = symbol.upper().strip()
-    return "USD" in s or "USDT" in s or s in ["BTC", "ETH", "SOL", "ADA", "XRP"]
+    if any(x in s for x in ["GOLD", "XAU", "CRUDE", "NIFTY", "SENSEX", "BSX"]):
+        return False
+    return any(x in s for x in ["BTC", "ETH", "SOL", "USDT"]) or s in ["ADA", "XRP"]
+
+REPORT_CATEGORY_LABELS = {
+    "INDEX_OPTIONS": "Index Options",
+    "CRYPTO_FUTURES": "Crypto Futures",
+    "MCX_GOLD": "MCX Gold",
+    "MCX_CRUDEOIL": "MCX Crudeoil",
+    "INDEX_FUTURES": "Index Futures",
+    "OTHER_OPTIONS": "Other Options",
+    "OTHER": "Other",
+}
+
+def get_report_category_code(symbol: str) -> str:
+    s = (symbol or "").upper()
+    parsed = parse_option_symbol(symbol)
+    underlying = parsed.get("underlying") if parsed.get("is_option") else normalize_base_symbol(symbol)
+
+    if parsed.get("is_option"):
+        if underlying in ["BANKNIFTY", "NIFTY", "SENSEX"]:
+            return "INDEX_OPTIONS"
+        return "OTHER_OPTIONS"
+
+    if is_usd_asset(symbol):
+        return "CRYPTO_FUTURES"
+    if underlying == "GOLD" or "GOLD" in s or "XAU" in s:
+        return "MCX_GOLD"
+    if underlying == "CRUDEOIL" or "CRUDE" in s:
+        return "MCX_CRUDEOIL"
+    if underlying in ["BANKNIFTY", "NIFTY", "SENSEX"]:
+        return "INDEX_FUTURES"
+    return "OTHER"
+
+def get_report_category_label(symbol: str) -> str:
+    return REPORT_CATEGORY_LABELS.get(get_report_category_code(symbol), "Other")
+
+def get_strategy_label_for_position(position: Position, signal: Optional[Signal] = None) -> str:
+    source_name = (signal.source_name or "").strip() if signal else ""
+    if source_name and source_name.lower() != "webhook strategy alert":
+        return source_name
+
+    category = get_report_category_code(position.symbol)
+    base = normalize_base_symbol(position.symbol)
+    parsed = parse_option_symbol(position.symbol)
+    if parsed.get("is_option"):
+        base = parsed.get("underlying") or base
+
+    friendly_base = {
+        "BANKNIFTY": "BNF",
+        "NIFTY": "Nifty",
+        "SENSEX": "Sensex",
+        "CRUDEOIL": "Crudeoil",
+        "GOLD": "Gold",
+    }.get(base, base or "Other")
+
+    if category == "INDEX_OPTIONS":
+        return f"{friendly_base} Option Buying"
+    if category == "CRYPTO_FUTURES":
+        return f"{friendly_base} Crypto Futures"
+    if category == "MCX_GOLD":
+        return "Gold"
+    if category == "MCX_CRUDEOIL":
+        return "Crudeoil"
+    if category == "INDEX_FUTURES":
+        return f"{friendly_base} Futures"
+    return friendly_base or "Other Strategy"
+
+def parse_optional_date(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        if "T" not in raw:
+            parsed_date = date.fromisoformat(raw[:10])
+            return datetime.combine(parsed_date, time.max if end_of_day else time.min)
+        parsed_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed_dt.tzinfo is not None:
+            parsed_dt = parsed_dt.astimezone().replace(tzinfo=None)
+        return parsed_dt
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {value}. Use YYYY-MM-DD.")
+
+def position_activity_time(position: Position) -> datetime:
+    return position.exit_time or position.entry_time
 
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    square_off_expired_intraday_positions(db)
     positions = db.query(Position).filter(Position.user_id == user.id).order_by(Position.entry_time.desc()).all()
-    
+    signal_ids = [p.signal_id for p in positions if p.signal_id is not None]
+    signals_by_id = {}
+    if signal_ids:
+        signals_by_id = {
+            s.id: s
+            for s in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()
+        }
+
     # Calculate stats
     closed_positions = [p for p in positions if p.status == "CLOSED"]
     open_positions = [p for p in positions if p.status == "OPEN"]
-    
+
     # Calculate open positions details & accumulate PnL separately
     positions_data = []
     total_pnl_inr = 0.0
     total_pnl_usd = 0.0
-    
+
     # Process open positions
     for p in positions:
+        linked_signal = signals_by_id.get(p.signal_id)
+        strategy_name = get_strategy_label_for_position(p, linked_signal)
+        report_category_code = get_report_category_code(p.symbol)
+        report_category = REPORT_CATEGORY_LABELS.get(report_category_code, "Other")
+        source_name = linked_signal.source_name if linked_signal else None
+
         if p.status == "OPEN":
             current_price = get_current_price(p.symbol, p.entry_price, db)
             if p.direction == "LONG":
                 pnl = (current_price - p.entry_price) * p.qty
             else:
                 pnl = (p.entry_price - current_price) * p.qty
-            
+
             if is_usd_asset(p.symbol):
                 total_pnl_usd += pnl
             else:
                 total_pnl_inr += pnl
-                
+
             positions_data.append({
                 "id": p.id,
                 "symbol": p.symbol,
@@ -1510,7 +1935,12 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
                 "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY"
+                "trade_type": p.trade_type or "INTRADAY",
+                "strategy_name": strategy_name,
+                "source_name": source_name,
+                "report_category": report_category,
+                "report_category_code": report_category_code,
+                "exit_reason": p.exit_reason
             })
         else:
             pnl = p.pnl
@@ -1518,7 +1948,7 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 total_pnl_usd += pnl
             else:
                 total_pnl_inr += pnl
-                
+
             positions_data.append({
                 "id": p.id,
                 "symbol": p.symbol,
@@ -1533,13 +1963,18 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
                 "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY"
+                "trade_type": p.trade_type or "INTRADAY",
+                "strategy_name": strategy_name,
+                "source_name": source_name,
+                "report_category": report_category,
+                "report_category_code": report_category_code,
+                "exit_reason": p.exit_reason
             })
-            
+
     total_trades = len(closed_positions)
     winning_trades = sum(1 for p in closed_positions if p.pnl > 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
-    
+
     return {
         "positions": positions_data,
         "stats": {
@@ -1557,17 +1992,17 @@ def manual_exit_position(pos_id: int, db: Session = Depends(get_db), user: User 
     pos = db.query(Position).filter(Position.id == pos_id, Position.user_id == user.id, Position.status == "OPEN").first()
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
-    
+
     # Resolve index exit price
     parts = pos.symbol.split()
     is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
     underlying = parts[0] if is_option else pos.symbol
-    
+
     index_exit_price = get_live_market_price(underlying)
     if index_exit_price is None:
         latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
         index_exit_price = latest_signal.price if latest_signal else pos.entry_price
-        
+
     close_position_entry(pos, index_exit_price, db)
     db.commit()
     return {"status": "success", "pnl": pos.pnl}
@@ -1618,7 +2053,7 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
             "configured": has,
             "info": masked
         })
-    
+
     crypto_list = []
     for crypto in CRYPTO_EXCHANGES:
         has = mgr.has_credentials(crypto['id'])
@@ -1631,7 +2066,7 @@ def get_credentials(db: Session = Depends(get_db), user: User = Depends(get_curr
             "configured": has,
             "info": masked
         })
-        
+
     return {
         "brokers": broker_list,
         "crypto": crypto_list
@@ -1662,10 +2097,10 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
     from backend.database import BrokerCredential
     from backend.credentials import deobfuscate
     import json
-    
+
     creds_list = db.query(BrokerCredential).filter(BrokerCredential.broker_id == "flattrade").all()
     target_user_id = None
-    
+
     if client:
         for c in creds_list:
             try:
@@ -1675,18 +2110,18 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
                     break
             except Exception:
                 continue
-                
+
     if not target_user_id:
         target_user_id = creds_list[0].user_id if creds_list else 1
-        
+
     mgr = AppCredentialsManager(db, user_id=target_user_id)
     creds = mgr.load_credentials("flattrade")
     if not creds:
         return HTMLResponse(content="<h2>Error: Flattrade credentials are not configured in the app yet. Please configure them first under settings.</h2>", status_code=400)
-    
+
     api_key = creds.get("api_key")
     api_secret = creds.get("api_secret")
-    
+
     try:
         token = exchange_request_code(api_key, api_secret, code)
     except Exception as e:
@@ -1694,14 +2129,14 @@ def broker_callback(code: str, client: str = Query(None), db: Session = Depends(
             content=f"<h2>Error: Failed to exchange request code for session token. Please verify your static IP and credentials.</h2><p style='color: #ef4444; font-family: monospace; font-size: 14px; background: rgba(239, 68, 68, 0.1); padding: 10px; border-radius: 6px;'>Details: {str(e)}</p>",
             status_code=400
         )
-        
+
     today_str = get_ist_time().date().isoformat()
     extra_fields = creds.get("extra", {}) or {}
     extra_fields["token"] = token
     extra_fields["token_date"] = today_str
-    
+
     mgr.save_credentials("flattrade", api_key, api_secret, extra=extra_fields)
-    
+
     html_content = """
     <html>
         <head>
@@ -1732,25 +2167,25 @@ def broker_login_redirect(broker_id: str, token: str = Query(None), db: Session 
         if user_info:
             supabase_uid = user_info.get("id")
             user = db.query(User).filter(User.supabase_uid == supabase_uid).first()
-            
+
     if not user:
         user = db.query(User).filter(User.id == 1).first()
-        
+
     if not user:
         raise HTTPException(status_code=401, detail="User not authenticated")
-        
+
     if broker_id != "flattrade":
         raise HTTPException(status_code=400, detail="Only Flattrade is supported for login redirection")
-        
+
     mgr = AppCredentialsManager(db, user_id=user.id)
     creds = mgr.load_credentials("flattrade")
     if not creds:
         raise HTTPException(status_code=400, detail="Flattrade credentials not configured. Please save them first.")
-        
+
     api_key = creds.get("api_key")
     if not api_key:
         raise HTTPException(status_code=400, detail="API Key not found in Flattrade credentials")
-        
+
     auth_url = f"https://auth.flattrade.in/?app_key={api_key}"
     return RedirectResponse(url=auth_url)
 
@@ -1773,6 +2208,8 @@ class ExecuteOrderRequest(BaseModel):
     trade_type: str  # FUTURE or OPTION
     mode: str        # LIVE or PAPER
     lots: float
+    preview_token: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 def get_lot_size(symbol: str) -> int:
     sym = symbol.upper()
@@ -1803,7 +2240,7 @@ def get_lot_size(symbol: str) -> int:
 def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     mgr = AppCredentialsManager(db, user_id=user.id)
     active_id = mgr.get_active_broker()
-    
+
     # Calculate open positions combined live open P&L
     positions = db.query(Position).filter(Position.status == "OPEN", Position.user_id == user.id).all()
     combined_pnl = 0.0
@@ -1814,7 +2251,7 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
         else:
             pnl = (p.entry_price - current_price) * p.qty
         combined_pnl += pnl
-            
+
     if active_id:
         masked = mgr.get_masked_info(active_id)
         return {
@@ -1835,23 +2272,123 @@ def get_broker_status(db: Session = Depends(get_db), user: User = Depends(get_cu
             "combined_open_pnl": round(combined_pnl, 2)
         }
 
+def prepare_aliceblue_order(**kwargs) -> dict:
+    raise HTTPException(status_code=501, detail="Alice Blue order preparation is not configured.")
+
+def place_aliceblue_order(**kwargs) -> dict:
+    return {"status": "error", "message": "Alice Blue live placement is not configured."}
+
+def place_flattrade_prepared_order(**kwargs) -> dict:
+    return {"status": "error", "message": "Flattrade live placement is not configured."}
+
+def resolve_manual_order_details(signal: Signal, trade_type: str, lots: float) -> dict:
+    sym_upper = signal.symbol.upper()
+    is_crypto = "BTC" in sym_upper or "ETH" in sym_upper or "SOL" in sym_upper or "USD" in sym_upper or "USDT" in sym_upper
+    qty = lots if is_crypto else lots * get_lot_size(signal.symbol)
+
+    if trade_type == "OPTION":
+        step = 50 if "NIFTY" in sym_upper else 100
+        underlying_price = get_live_market_price(signal.symbol) or signal.price
+        opt_strike = int(round(underlying_price / step) * step)
+        opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
+        ist_now = get_ist_time()
+        if sym_upper == "BANKNIFTY":
+            expiry_date = get_next_monthly_expiry(ist_now, weekday=1)
+        elif sym_upper == "NIFTY":
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        elif sym_upper == "SENSEX":
+            expiry_date = get_next_weekly_expiry(ist_now, 3)
+        else:
+            expiry_date = get_next_weekly_expiry(ist_now, 1)
+        trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
+        live_option_price = get_live_market_price(trade_symbol)
+        entry_price = live_option_price if live_option_price is not None and live_option_price > 0 else calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date)
+        direction = "LONG"
+    else:
+        trade_symbol = signal.symbol
+        entry_price = get_live_market_price(signal.symbol) or signal.price
+        direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
+
+    return {
+        "symbol": trade_symbol,
+        "direction": direction,
+        "qty": qty,
+        "entry_price": round(float(entry_price), 2),
+        "transaction_type": "BUY" if direction == "LONG" else "SELL",
+    }
+
+@app.post("/api/broker/order-preview")
+def broker_order_preview(req: ExecuteOrderRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if req.mode.upper() != "LIVE":
+        raise HTTPException(status_code=400, detail="Preview is only required for live orders.")
+    if not env_flag("LIVE_TRADING_ENABLED"):
+        raise HTTPException(status_code=503, detail="Live trading is disabled on the server.")
+
+    signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+
+    mgr = AppCredentialsManager(db, user_id=user.id)
+    active_broker = mgr.get_active_broker()
+    if not active_broker:
+        raise HTTPException(status_code=400, detail="No API Credentials configured.")
+
+    details = resolve_manual_order_details(signal, req.trade_type, req.lots)
+    if active_broker == "aliceblue":
+        preview = prepare_aliceblue_order(
+            user_id=user.id,
+            signal=signal,
+            details=details,
+            lots=req.lots,
+            trade_type=req.trade_type,
+            db=db,
+        )
+    else:
+        preview = {
+            "broker_id": "flattrade",
+            "broker_name": "Flattrade",
+            "symbol": details["symbol"],
+            "trading_symbol": details["symbol"],
+            "instrument_id": None,
+            "exchange": "NFO",
+            "transaction_type": details["transaction_type"],
+            "quantity": int(details["qty"]),
+            "lot_size": get_lot_size(signal.symbol),
+            "lots": req.lots,
+            "product": "INTRADAY" if (signal.trade_type or "INTRADAY").upper() == "INTRADAY" else "CARRYFORWARD",
+            "order_type": "LIMIT",
+            "validity": "DAY",
+            "limit_price": details["entry_price"],
+        }
+    preview["preview_token"] = f"preview_{secrets.token_urlsafe(24)}"
+    return preview
+
 @app.post("/api/broker/execute")
 def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     signal = db.query(Signal).filter(Signal.id == req.signal_id).first()
     if not signal:
         raise HTTPException(status_code=404, detail="Signal not found")
-        
+
     # Block manual entry executions on exit signals (Sell, Cover, Exit)
     if signal.action.upper() in ["EXIT", "EXIT_LONG", "EXIT_SHORT", "CLOSE", "COVER", "SELL"]:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="This is an exit signal (Sell/Cover). Entries are only allowed on Long or Short signals."
         )
 
+    mgr = None
+    active_broker = None
+
     # Check if user has credentials linked when mode is LIVE
     if req.mode.upper() == "LIVE":
+        if not env_flag("LIVE_TRADING_ENABLED"):
+            raise HTTPException(
+                status_code=503,
+                detail="Live trading is disabled on the server."
+            )
         mgr = AppCredentialsManager(db, user_id=user.id)
-        if not mgr.get_active_broker():
+        active_broker = mgr.get_active_broker()
+        if not active_broker:
             raise HTTPException(
                 status_code=400,
                 detail="No API Credentials configured. Please configure your broker credentials under the Auto-Trade tab before executing a live order."
@@ -1871,7 +2408,7 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     ).first()
     if exit_exists:
         raise HTTPException(status_code=400, detail="This signal is no longer active (an exit signal has already been received)")
-        
+
     # Check duplicate trade prevention per signal and contract type separately
     existing = None
     if req.trade_type == "OPTION":
@@ -1896,26 +2433,26 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
     if existing:
         lots_used = existing.lot_size or 1
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"A {req.trade_type} trade is already running on this signal with {lots_used} lots. You cannot place another {req.trade_type} trade on the same signal."
         )
-        
+
     # Calculate Qty based on Lots
     sym_upper = signal.symbol.upper()
     is_crypto = "BTC" in sym_upper or "ETH" in sym_upper or "SOL" in sym_upper or "USD" in sym_upper or "USDT" in sym_upper
-    
+
     if is_crypto:
         qty = req.lots
     else:
         qty = req.lots * get_lot_size(signal.symbol)
-        
+
     # Strike and premium / entry price resolution
     if req.trade_type == "OPTION":
         step = 50 if "NIFTY" in sym_upper else 100
         underlying_price = get_live_market_price(signal.symbol) or signal.price
         opt_strike = int(round(underlying_price / step) * step)
         opt_type = "CE" if signal.action in ["LONG", "BUY"] else "PE"
-        
+
         # Determine expiry date
         ist_now = get_ist_time()
         if sym_upper == "BANKNIFTY":
@@ -1926,32 +2463,48 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
             expiry_date = get_next_weekly_expiry(ist_now, 3)
         else:
             expiry_date = get_next_weekly_expiry(ist_now, 1)
-            
+
         trade_symbol = f"{signal.symbol} {expiry_date.strftime('%d%b%y').upper()} {opt_strike} {opt_type}"
-        
-        entry_price = calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date)
+
+        live_option_price = get_live_market_price(trade_symbol)
+        entry_price = live_option_price if live_option_price is not None and live_option_price > 0 else calculate_option_price_bs(signal.symbol, opt_strike, opt_type, underlying_price, expiry_date=expiry_date)
         direction = "LONG"
     else:
         trade_symbol = signal.symbol
         entry_price = get_live_market_price(signal.symbol) or signal.price
         direction = "LONG" if signal.action in ["LONG", "BUY"] else "SHORT"
-        
+
+    live_broker_result = None
     if req.mode.upper() == "LIVE":
-        active_broker = mgr.get_active_broker()
-        if active_broker == "flattrade":
-            res = place_flattrade_order(
+        prepared_order = {
+            "broker_id": active_broker,
+            "symbol": trade_symbol,
+            "trading_symbol": trade_symbol,
+            "transaction_type": "BUY" if direction == "LONG" else "SELL",
+            "quantity": int(qty),
+            "limit_price": round(entry_price, 2),
+            "trade_type": signal.trade_type or "INTRADAY",
+        }
+        if active_broker == "aliceblue":
+            live_broker_result = place_aliceblue_order(
                 user_id=user.id,
-                symbol=trade_symbol,
-                direction=direction,
-                qty=qty,
-                price=entry_price,
+                prepared_order=prepared_order,
                 db=db,
-                trade_type=signal.trade_type
             )
-            if res.get("status") == "error":
-                raise HTTPException(status_code=400, detail=f"Flattrade API Order Failed: {res.get('message')}")
-        
+        elif active_broker == "flattrade":
+            live_broker_result = place_flattrade_prepared_order(
+                user_id=user.id,
+                prepared_order=prepared_order,
+                db=db,
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported broker: {active_broker}")
+
+        if live_broker_result.get("status") == "error":
+            raise HTTPException(status_code=400, detail=f"Broker API Order Failed: {live_broker_result.get('message')}")
+
     # Create the position
+    broker_order_id = live_broker_result.get("broker_order_id") if live_broker_result else None
     new_pos = Position(
         user_id=user.id,
         symbol=trade_symbol,
@@ -1960,21 +2513,46 @@ def execute_broker_order(req: ExecuteOrderRequest, db: Session = Depends(get_db)
         lot_size=int(req.lots),
         entry_price=round(entry_price, 2),
         entry_time=get_ist_time(),
-        status="OPEN",
+        status="PENDING" if req.mode.upper() == "LIVE" else "OPEN",
         real_or_paper=req.mode,
         signal_id=req.signal_id,
         timeframe=signal.timeframe,
-        trade_type=signal.trade_type
+        trade_type=signal.trade_type,
+        broker_id=active_broker,
+        entry_broker_order_id=broker_order_id,
+        entry_order_status="SUBMITTED" if req.mode.upper() == "LIVE" else "FILLED",
     )
     db.add(new_pos)
+    db.flush()
+
+    if req.mode.upper() == "LIVE":
+        db.add(BrokerOrder(
+            user_id=user.id,
+            signal_id=req.signal_id,
+            position_id=new_pos.id,
+            broker_id=active_broker,
+            idempotency_key=req.idempotency_key or f"{req.signal_id}-{req.trade_type}-{secrets.token_hex(8)}",
+            order_kind="ENTRY",
+            symbol=trade_symbol,
+            broker_trading_symbol=trade_symbol,
+            broker_instrument_id=None,
+            transaction_type="BUY" if direction == "LONG" else "SELL",
+            quantity=int(qty),
+            limit_price=round(entry_price, 2),
+            status="SUBMITTED",
+            broker_order_id=broker_order_id,
+            broker_response=json.dumps(live_broker_result.get("broker_response", live_broker_result)),
+            updated_at=get_ist_time(),
+        ))
     db.commit()
-    
+
     return {
         "status": "success",
         "symbol": trade_symbol,
         "qty": qty,
         "entry_price": entry_price,
-        "mode": req.mode
+        "mode": req.mode,
+        "order_status": "FILLED" if req.mode.upper() == "PAPER" else "SUBMITTED"
     }
 
 @app.post("/api/broker/manual-exit/{pos_id}")
@@ -1982,16 +2560,16 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
     pos = db.query(Position).filter(Position.id == pos_id, Position.user_id == user.id, Position.status == "OPEN").first()
     if not pos:
         raise HTTPException(status_code=404, detail="Open position not found")
-        
+
     parts = pos.symbol.split()
     is_option = len(parts) >= 3 and parts[-1] in ["CE", "PE"]
     underlying = parts[0] if is_option else pos.symbol
-    
+
     index_exit_price = get_live_market_price(underlying)
     if index_exit_price is None:
         latest_signal = db.query(Signal).filter(Signal.symbol == underlying).order_by(Signal.timestamp.desc()).first()
         index_exit_price = latest_signal.price if latest_signal else pos.entry_price
-        
+
     try:
         close_position_entry(pos, index_exit_price, db)
         db.commit()
@@ -2000,19 +2578,62 @@ def manual_exit_broker_position(pos_id: int, db: Session = Depends(get_db), user
     return {"status": "success", "pnl": pos.pnl}
 
 @app.post("/api/admin/purge-test-data")
-def purge_test_data(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def purge_test_data(req: Optional[PurgeRequest] = Body(default=None), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     try:
-        num_positions = db.query(Position).filter(Position.user_id == user.id).delete()
-        num_signals = db.query(Signal).delete()
+        segment = ((req.segment if req else None) or "ALL").strip().upper()
+        if segment not in {"ALL", *REPORT_CATEGORY_LABELS.keys()}:
+            raise HTTPException(status_code=400, detail=f"Unsupported purge segment: {segment}")
+
+        start_dt = parse_optional_date(req.start_date if req else None)
+        end_dt = parse_optional_date(req.end_date if req else None, end_of_day=True)
+        if start_dt and end_dt and start_dt > end_dt:
+            raise HTTPException(status_code=400, detail="Start date must be before end date.")
+
+        positions = db.query(Position).filter(Position.user_id == user.id).all()
+        matched_positions = []
+        for pos in positions:
+            activity_time = position_activity_time(pos)
+            if start_dt and activity_time < start_dt:
+                continue
+            if end_dt and activity_time > end_dt:
+                continue
+            if segment != "ALL" and get_report_category_code(pos.symbol) != segment:
+                continue
+            matched_positions.append(pos)
+
+        position_ids = [pos.id for pos in matched_positions]
+        signal_ids = {pos.signal_id for pos in matched_positions if pos.signal_id is not None}
+
+        num_positions = 0
+        if position_ids:
+            num_positions = db.query(Position).filter(
+                Position.user_id == user.id,
+                Position.id.in_(position_ids)
+            ).delete(synchronize_session=False)
+
+        num_signals = 0
+        if segment == "ALL" and not start_dt and not end_dt:
+            num_signals = db.query(Signal).delete(synchronize_session=False)
+        elif signal_ids:
+            for signal_id in signal_ids:
+                still_used = db.query(Position.id).filter(Position.signal_id == signal_id).first()
+                if not still_used:
+                    num_signals += db.query(Signal).filter(Signal.id == signal_id).delete(synchronize_session=False)
+
         db.commit()
         return {
             "status": "success",
             "purged_positions": num_positions,
             "purged_signals": num_signals,
-            "detail": "Successfully cleared all user positions and signals."
+            "segment": segment,
+            "start_date": req.start_date if req else None,
+            "end_date": req.end_date if req else None,
+            "detail": "Successfully cleared matching positions and orphaned signals."
         }
     except Exception as e:
         db.rollback()
+        if isinstance(e, HTTPException):
+            raise e
         raise HTTPException(status_code=500, detail=f"Database error during purge: {e}")
 
 @app.get("/api/admin/debug-info")
@@ -2022,24 +2643,24 @@ def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User
         VALID_SECRETS = [s.strip() for s in env_secrets.split(",")]
     else:
         VALID_SECRETS = ["TradeSignal2024", "indian_market_5645c3c44e98ddb7ed7aee5f05482e6e9e910031", "8cf895aa0e3387d51d8c6c19f3dea05e02e2839b"]
-        
+
     if not secret or secret not in VALID_SECRETS:
         raise HTTPException(status_code=401, detail="Unauthorized debug request")
-        
+
     from sqlalchemy import inspect
     inspector = inspect(db.bind)
-    
+
     tables_schema = {}
     for table_name in ["users", "signals", "positions", "daily_consents", "broker_credentials"]:
         columns = [{"name": col["name"], "type": str(col["type"])} for col in inspector.get_columns(table_name)]
         tables_schema[table_name] = columns
-        
+
     db_type = "PostgreSQL" if "postgresql" in str(db.bind.url) else "SQLite"
-    
+
     signals = db.query(Signal).order_by(Signal.timestamp.desc()).limit(20).all()
     positions = db.query(Position).order_by(Position.entry_time.desc()).limit(20).all()
     consents = db.query(DailyConsent).order_by(DailyConsent.timestamp.desc()).limit(20).all()
-    
+
     from backend.database import BrokerCredential
     creds = db.query(BrokerCredential).all()
     masked_creds = [{
@@ -2049,7 +2670,7 @@ def get_debug_info(secret: str = None, db: Session = Depends(get_db), user: User
         "api_key_len": len(c.api_key) if c.api_key else 0,
         "has_secret": bool(c.api_secret)
     } for c in creds]
-    
+
     return {
         "db_type": db_type,
         "tables_schema": tables_schema,
@@ -2080,4 +2701,3 @@ from fastapi.staticfiles import StaticFiles
 simulator_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "simulator")
 if os.path.exists(simulator_dir):
     app.mount("/", StaticFiles(directory=simulator_dir, html=True), name="static")
-
