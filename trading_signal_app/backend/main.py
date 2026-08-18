@@ -292,7 +292,9 @@ def test_login(req: TestLoginRequest, db: Session = Depends(get_db)):
     }
 
 def get_base_symbol(symbol: str) -> str:
-    s = symbol.upper().strip()
+    s = str(symbol or "").upper().strip()
+    if not s:
+        return ""
     if ":" in s:
         s = s.split(":")[-1]
 
@@ -394,13 +396,28 @@ def get_ist_time() -> datetime:
 
 import re
 
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def safe_isoformat(value) -> Optional[str]:
+    if not value:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
 MONTH_MAP = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
 }
 
 def parse_option_symbol(symbol: str) -> dict:
-    s = symbol.upper().strip()
+    s = str(symbol or "").upper().strip()
+    if not s:
+        return {"is_option": False}
     if ":" in s:
         s = s.split(":")[-1]
     if s.startswith("OPTIDX_"):
@@ -651,7 +668,9 @@ def calculate_option_price_bs(underlying: str, strike: float, opt_type: str, liv
 
 # Helper to normalize symbols
 def normalize_symbol(symbol: str) -> str:
-    s = symbol.upper().strip()
+    s = str(symbol or "").upper().strip()
+    if not s:
+        return ""
 
     # Check if option symbol first
     parse_res = parse_option_symbol(s)
@@ -706,7 +725,7 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session, re
     else:
         exit_price = index_exit_price
 
-    if pos.real_or_paper.upper() == "LIVE":
+    if str(pos.real_or_paper or "PAPER").upper() == "LIVE":
         from backend.credentials import AppCredentialsManager
         mgr = AppCredentialsManager(db, user_id=pos.user_id)
         active_broker = mgr.get_active_broker()
@@ -728,10 +747,12 @@ def close_position_entry(pos: Position, index_exit_price: float, db: Session, re
     pos.exit_time = get_ist_time()
     pos.status = "CLOSED"
 
-    if pos.direction == "LONG":
-        pos.pnl = round((pos.exit_price - pos.entry_price) * pos.qty, 2)
+    entry_price = safe_float(pos.entry_price)
+    qty = safe_float(pos.qty)
+    if str(pos.direction or "").upper() == "LONG":
+        pos.pnl = round((pos.exit_price - entry_price) * qty, 2)
     else:
-        pos.pnl = round((pos.entry_price - pos.exit_price) * pos.qty, 2)
+        pos.pnl = round((entry_price - pos.exit_price) * qty, 2)
 
     return pos.pnl
 
@@ -1790,7 +1811,7 @@ def get_current_price(symbol: str, entry_price: float, db: Session) -> float:
     return round(simulated_price, 2)
 
 def is_usd_asset(symbol: str) -> bool:
-    s = symbol.upper().strip()
+    s = str(symbol or "").upper().strip()
     if any(x in s for x in ["GOLD", "XAU", "CRUDE", "NIFTY", "SENSEX", "BSX"]):
         return False
     return any(x in s for x in ["BTC", "ETH", "SOL", "USDT"]) or s in ["ADA", "XRP"]
@@ -1808,7 +1829,7 @@ REPORT_CATEGORY_LABELS = {
 def get_report_category_code(symbol: str) -> str:
     s = (symbol or "").upper()
     parsed = parse_option_symbol(symbol)
-    underlying = parsed.get("underlying") if parsed.get("is_option") else normalize_base_symbol(symbol)
+    underlying = parsed.get("underlying") if parsed.get("is_option") else get_base_symbol(symbol)
 
     if parsed.get("is_option"):
         if underlying in ["BANKNIFTY", "NIFTY", "SENSEX"]:
@@ -1834,7 +1855,7 @@ def get_strategy_label_for_position(position: Position, signal: Optional[Signal]
         return source_name
 
     category = get_report_category_code(position.symbol)
-    base = normalize_base_symbol(position.symbol)
+    base = get_base_symbol(position.symbol)
     parsed = parse_option_symbol(position.symbol)
     if parsed.get("is_option"):
         base = parsed.get("underlying") or base
@@ -1877,7 +1898,7 @@ def parse_optional_date(value: Optional[str], end_of_day: bool = False) -> Optio
         raise HTTPException(status_code=400, detail=f"Invalid date: {value}. Use YYYY-MM-DD.")
 
 def position_activity_time(position: Position) -> datetime:
-    return position.exit_time or position.entry_time
+    return position.exit_time or position.entry_time or datetime.min
 
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
@@ -1897,96 +1918,107 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
         }
 
     # Calculate stats
-    closed_positions = [p for p in positions if p.status == "CLOSED"]
-    open_positions = [p for p in positions if p.status == "OPEN"]
+    closed_positions = [p for p in positions if str(p.status or "").upper() == "CLOSED"]
+    open_positions = [p for p in positions if str(p.status or "").upper() in {"OPEN", "PARTIAL", "PENDING"}]
 
     # Calculate open positions details & accumulate PnL separately
     positions_data = []
     total_pnl_inr = 0.0
     total_pnl_usd = 0.0
 
-    # Process open positions
+    # Process positions. A single malformed legacy row should not blank the full ledger.
+    row_errors = []
     for p in positions:
-        qty = float(p.qty or 0.0)
-        entry_price = float(p.entry_price or 0.0)
-        linked_signal = signals_by_id.get(p.signal_id)
-        strategy_name = get_strategy_label_for_position(p, linked_signal)
-        report_category_code = get_report_category_code(p.symbol)
-        report_category = REPORT_CATEGORY_LABELS.get(report_category_code, "Other")
-        source_name = linked_signal.source_name if linked_signal else None
+        try:
+            qty = safe_float(p.qty)
+            entry_price = safe_float(p.entry_price)
+            symbol = str(p.symbol or "UNKNOWN").strip() or "UNKNOWN"
+            status_value = str(p.status or "OPEN").upper()
+            direction = str(p.direction or "LONG").upper()
+            real_or_paper = str(p.real_or_paper or "PAPER").upper()
+            trade_type = str(p.trade_type or "INTRADAY").upper()
+            linked_signal = signals_by_id.get(p.signal_id)
+            strategy_name = get_strategy_label_for_position(p, linked_signal)
+            report_category_code = get_report_category_code(symbol)
+            report_category = REPORT_CATEGORY_LABELS.get(report_category_code, "Other")
+            source_name = linked_signal.source_name if linked_signal else None
 
-        if p.status == "OPEN":
-            try:
-                current_price = get_current_price(p.symbol, entry_price, db)
-            except Exception as exc:
-                print(f"[Paper Trades] Price refresh failed for position {p.id} {p.symbol}: {exc}")
-                current_price = entry_price
-            if p.direction == "LONG":
-                pnl = (current_price - entry_price) * qty
+            if status_value in {"OPEN", "PARTIAL", "PENDING"}:
+                try:
+                    current_price = get_current_price(symbol, entry_price, db)
+                except Exception as exc:
+                    print(f"[Paper Trades] Price refresh failed for position {p.id} {symbol}: {exc}")
+                    current_price = entry_price
+                if direction == "LONG":
+                    pnl = (current_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - current_price) * qty
+
+                if is_usd_asset(symbol):
+                    total_pnl_usd += pnl
+                else:
+                    total_pnl_inr += pnl
+
+                positions_data.append({
+                    "id": p.id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "entry_time": safe_isoformat(p.entry_time),
+                    "exit_price": None,
+                    "exit_time": None,
+                    "status": status_value,
+                    "current_price": current_price,
+                    "pnl": round(pnl, 2),
+                    "real_or_paper": real_or_paper,
+                    "signal_id": p.signal_id,
+                    "timeframe": p.timeframe,
+                    "trade_type": trade_type,
+                    "strategy_name": strategy_name,
+                    "source_name": source_name,
+                    "report_category": report_category,
+                    "report_category_code": report_category_code,
+                    "exit_reason": p.exit_reason
+                })
             else:
-                pnl = (entry_price - current_price) * qty
+                pnl = safe_float(p.pnl)
+                if is_usd_asset(symbol):
+                    total_pnl_usd += pnl
+                else:
+                    total_pnl_inr += pnl
 
-            if is_usd_asset(p.symbol):
-                total_pnl_usd += pnl
-            else:
-                total_pnl_inr += pnl
-
-            positions_data.append({
-                "id": p.id,
-                "symbol": p.symbol,
-                "direction": p.direction,
-                "qty": qty,
-                "entry_price": entry_price,
-                "entry_time": p.entry_time.isoformat() if p.entry_time else None,
-                "exit_price": None,
-                "exit_time": None,
-                "status": p.status,
-                "current_price": current_price,
-                "pnl": round(pnl, 2),
-                "real_or_paper": p.real_or_paper,
-                "signal_id": p.signal_id,
-                "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY",
-                "strategy_name": strategy_name,
-                "source_name": source_name,
-                "report_category": report_category,
-                "report_category_code": report_category_code,
-                "exit_reason": p.exit_reason
-            })
-        else:
-            pnl = float(p.pnl or 0.0)
-            if is_usd_asset(p.symbol):
-                total_pnl_usd += pnl
-            else:
-                total_pnl_inr += pnl
-
-            positions_data.append({
-                "id": p.id,
-                "symbol": p.symbol,
-                "direction": p.direction,
-                "qty": qty,
-                "entry_price": entry_price,
-                "entry_time": p.entry_time.isoformat() if p.entry_time else None,
-                "exit_price": float(p.exit_price) if p.exit_price is not None else None,
-                "exit_time": p.exit_time.isoformat() if p.exit_time else None,
-                "status": p.status,
-                "pnl": pnl,
-                "real_or_paper": p.real_or_paper,
-                "signal_id": p.signal_id,
-                "timeframe": p.timeframe,
-                "trade_type": p.trade_type or "INTRADAY",
-                "strategy_name": strategy_name,
-                "source_name": source_name,
-                "report_category": report_category,
-                "report_category_code": report_category_code,
-                "exit_reason": p.exit_reason
-            })
+                positions_data.append({
+                    "id": p.id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "entry_time": safe_isoformat(p.entry_time),
+                    "exit_price": safe_float(p.exit_price) if p.exit_price is not None else None,
+                    "exit_time": safe_isoformat(p.exit_time),
+                    "status": status_value,
+                    "pnl": pnl,
+                    "real_or_paper": real_or_paper,
+                    "signal_id": p.signal_id,
+                    "timeframe": p.timeframe,
+                    "trade_type": trade_type,
+                    "strategy_name": strategy_name,
+                    "source_name": source_name,
+                    "report_category": report_category,
+                    "report_category_code": report_category_code,
+                    "exit_reason": p.exit_reason
+                })
+        except Exception as exc:
+            row_errors.append({"position_id": getattr(p, "id", None), "error": str(exc)})
+            print(f"[Paper Trades] Skipping malformed position {getattr(p, 'id', None)}: {exc}")
+            continue
 
     total_trades = len(closed_positions)
-    winning_trades = sum(1 for p in closed_positions if float(p.pnl or 0.0) > 0)
+    winning_trades = sum(1 for p in closed_positions if safe_float(p.pnl) > 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
 
-    return {
+    response = {
         "positions": positions_data,
         "stats": {
             "total_pnl": round(total_pnl_inr, 2), # for backward compatibility
@@ -1997,6 +2029,9 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
             "open_count": len(open_positions)
         }
     }
+    if row_errors:
+        response["warnings"] = row_errors[:10]
+    return response
 
 @app.post("/api/paper-trades/manual-exit/{pos_id}")
 def manual_exit_position(pos_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):

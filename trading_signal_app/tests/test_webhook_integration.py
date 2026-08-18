@@ -735,6 +735,35 @@ class BankNiftyWebhookIntegrationTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_paper_trades_endpoint_survives_malformed_position(self):
+        db = SessionLocal()
+        try:
+            position = Position(
+                user_id=1,
+                symbol=None,
+                direction=None,
+                qty=None,
+                entry_price=None,
+                status="CLOSED",
+                real_or_paper=None,
+                trade_type=None,
+            )
+            db.add(position)
+            db.commit()
+            position_id = position.id
+        finally:
+            db.close()
+
+        with patch("backend.main.square_off_expired_intraday_positions", return_value={}):
+            response = self.client.get("/api/paper-trades")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIn("positions", body)
+        row = next(item for item in body["positions"] if item["id"] == position_id)
+        self.assertEqual(row["symbol"], "UNKNOWN")
+        self.assertEqual(row["status"], "CLOSED")
+
 
 if __name__ == "__main__":
     unittest.main()
