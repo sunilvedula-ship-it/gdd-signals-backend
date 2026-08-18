@@ -1881,7 +1881,12 @@ def position_activity_time(position: Position) -> datetime:
 
 @app.get("/api/paper-trades")
 def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    square_off_expired_intraday_positions(db)
+    try:
+        square_off_expired_intraday_positions(db)
+    except Exception as exc:
+        db.rollback()
+        print(f"[Paper Trades] Intraday square-off skipped due to error: {exc}")
+
     positions = db.query(Position).filter(Position.user_id == user.id).order_by(Position.entry_time.desc()).all()
     signal_ids = [p.signal_id for p in positions if p.signal_id is not None]
     signals_by_id = {}
@@ -1902,6 +1907,8 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
 
     # Process open positions
     for p in positions:
+        qty = float(p.qty or 0.0)
+        entry_price = float(p.entry_price or 0.0)
         linked_signal = signals_by_id.get(p.signal_id)
         strategy_name = get_strategy_label_for_position(p, linked_signal)
         report_category_code = get_report_category_code(p.symbol)
@@ -1909,11 +1916,15 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
         source_name = linked_signal.source_name if linked_signal else None
 
         if p.status == "OPEN":
-            current_price = get_current_price(p.symbol, p.entry_price, db)
+            try:
+                current_price = get_current_price(p.symbol, entry_price, db)
+            except Exception as exc:
+                print(f"[Paper Trades] Price refresh failed for position {p.id} {p.symbol}: {exc}")
+                current_price = entry_price
             if p.direction == "LONG":
-                pnl = (current_price - p.entry_price) * p.qty
+                pnl = (current_price - entry_price) * qty
             else:
-                pnl = (p.entry_price - current_price) * p.qty
+                pnl = (entry_price - current_price) * qty
 
             if is_usd_asset(p.symbol):
                 total_pnl_usd += pnl
@@ -1924,9 +1935,9 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "id": p.id,
                 "symbol": p.symbol,
                 "direction": p.direction,
-                "qty": p.qty,
-                "entry_price": p.entry_price,
-                "entry_time": p.entry_time.isoformat(),
+                "qty": qty,
+                "entry_price": entry_price,
+                "entry_time": p.entry_time.isoformat() if p.entry_time else None,
                 "exit_price": None,
                 "exit_time": None,
                 "status": p.status,
@@ -1943,7 +1954,7 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "exit_reason": p.exit_reason
             })
         else:
-            pnl = p.pnl
+            pnl = float(p.pnl or 0.0)
             if is_usd_asset(p.symbol):
                 total_pnl_usd += pnl
             else:
@@ -1953,13 +1964,13 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
                 "id": p.id,
                 "symbol": p.symbol,
                 "direction": p.direction,
-                "qty": p.qty,
-                "entry_price": p.entry_price,
-                "entry_time": p.entry_time.isoformat(),
-                "exit_price": p.exit_price,
+                "qty": qty,
+                "entry_price": entry_price,
+                "entry_time": p.entry_time.isoformat() if p.entry_time else None,
+                "exit_price": float(p.exit_price) if p.exit_price is not None else None,
                 "exit_time": p.exit_time.isoformat() if p.exit_time else None,
                 "status": p.status,
-                "pnl": p.pnl,
+                "pnl": pnl,
                 "real_or_paper": p.real_or_paper,
                 "signal_id": p.signal_id,
                 "timeframe": p.timeframe,
@@ -1972,7 +1983,7 @@ def get_paper_trades(db: Session = Depends(get_db), user: User = Depends(get_cur
             })
 
     total_trades = len(closed_positions)
-    winning_trades = sum(1 for p in closed_positions if p.pnl > 0)
+    winning_trades = sum(1 for p in closed_positions if float(p.pnl or 0.0) > 0)
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
 
     return {
