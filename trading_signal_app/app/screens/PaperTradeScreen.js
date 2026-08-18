@@ -122,6 +122,8 @@ const REPORT_RANGE_OPTIONS = [
 
 const REPORT_CATEGORY_ORDER = REPORT_CATEGORY_OPTIONS.map(item => item.label);
 const REPORT_CATEGORY_BY_ID = REPORT_CATEGORY_OPTIONS.reduce((acc, item) => ({ ...acc, [item.id]: item }), {});
+const INDEX_OPTION_ASSET_ORDER = ['Banknifty', 'Nifty', 'Sensex', 'Other'];
+const TRADE_TYPE_ORDER = ['Intraday', 'Positional'];
 
 const isOptionContract = (symbol) => {
   const sym = (symbol || '').toUpperCase();
@@ -140,6 +142,19 @@ const getHistoryAssetLabel = (symbol) => {
   if (base === 'GOLD') return 'Gold';
   if (base === 'CRUDEOIL') return 'Crudeoil';
   return base || 'Other';
+};
+
+const getIndexOptionAssetLabel = (symbol) => {
+  const base = getNormalizedBaseSymbol(symbol);
+  if (base === 'BANKNIFTY') return 'Banknifty';
+  if (base === 'NIFTY') return 'Nifty';
+  if (base === 'SENSEX') return 'Sensex';
+  return 'Other';
+};
+
+const getTradeTypeLabel = (item) => {
+  const tradeType = (item.trade_type || '').toUpperCase();
+  return tradeType === 'POSITIONAL' ? 'Positional' : 'Intraday';
 };
 
 const getReportingCategoryInfo = (item) => {
@@ -277,6 +292,26 @@ const getGroupedHistory = (historyPositions) => {
     if (!grouped[category]) {
       grouped[category] = {};
     }
+
+    if (category === 'Index Options') {
+      const asset = getIndexOptionAssetLabel(item.symbol);
+      const tradeType = getTradeTypeLabel(item);
+      if (!grouped[category][asset]) {
+        grouped[category][asset] = {};
+      }
+      if (!grouped[category][asset][tradeType]) {
+        grouped[category][asset][tradeType] = {};
+      }
+      if (!grouped[category][asset][tradeType][strategy]) {
+        grouped[category][asset][tradeType][strategy] = {};
+      }
+      if (!grouped[category][asset][tradeType][strategy][dateKey]) {
+        grouped[category][asset][tradeType][strategy][dateKey] = [];
+      }
+      grouped[category][asset][tradeType][strategy][dateKey].push(item);
+      return;
+    }
+
     if (!grouped[category][strategy]) {
       grouped[category][strategy] = {};
     }
@@ -286,17 +321,18 @@ const getGroupedHistory = (historyPositions) => {
     grouped[category][strategy][dateKey].push(item);
   });
 
-  Object.values(grouped).forEach(strategyGroups => {
-    Object.values(strategyGroups).forEach(dateGroups => {
-      Object.values(dateGroups).forEach(items => {
-        items.sort((a, b) => {
-          const aTime = new Date(a.exit_time || a.entry_time || 0).getTime();
-          const bTime = new Date(b.exit_time || b.entry_time || 0).getTime();
-          return bTime - aTime;
-        });
+  const sortLeafItems = (node) => {
+    if (Array.isArray(node)) {
+      node.sort((a, b) => {
+        const aTime = new Date(a.exit_time || a.entry_time || 0).getTime();
+        const bTime = new Date(b.exit_time || b.entry_time || 0).getTime();
+        return bTime - aTime;
       });
-    });
-  });
+      return;
+    }
+    Object.values(node || {}).forEach(sortLeafItems);
+  };
+  sortLeafItems(grouped);
   return grouped;
 };
 
@@ -839,6 +875,134 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
     const groupedHistory = getGroupedHistory(items);
     const sortedCategories = getSortedKeys(groupedHistory, REPORT_CATEGORY_ORDER);
 
+    const renderDateGroups = (dateGroups, parentKey) => (
+      getSortedKeys(dateGroups).sort((a, b) => b.localeCompare(a)).map(dateKey => {
+        const dateCollapseKey = `${parentKey}_date_${dateKey}`;
+        const isDateCollapsed = !!collapsedDates[dateCollapseKey];
+        const dateItems = dateGroups[dateKey];
+        const datePnL = calculatePnLSum(dateItems);
+
+        return (
+          <View key={dateKey} style={styles.subgroupWrapper}>
+            <TouchableOpacity
+              style={styles.subgroupCollapseHeader}
+              onPress={() => setCollapsedDates(prev => ({ ...prev, [dateCollapseKey]: !prev[dateCollapseKey] }))}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                <Text style={{ fontSize: 9, color: '#6b7280', marginRight: 6 }}>
+                  {isDateCollapsed ? '>' : 'v'}
+                </Text>
+                <Text style={styles.subgroupCollapseTitle} numberOfLines={1}>{formatDateKey(dateKey)}</Text>
+              </View>
+              {renderHistoryPnL(datePnL)}
+            </TouchableOpacity>
+
+            {!isDateCollapsed && includePositionCards && (
+              <View style={styles.subgroupCollapseContent}>
+                {dateItems.map(item => renderPositionCard(item))}
+              </View>
+            )}
+          </View>
+        );
+      })
+    );
+
+    const renderStrategyGroups = (strategyGroups, parentKey, nested = false) => (
+      getSortedKeys(strategyGroups).map(strategy => {
+        const strategyKey = `${parentKey}_strategy_${strategy}`;
+        const isStrategyCollapsed = !!collapsedSubgroups[strategyKey];
+        const strategyItems = getHistoryItems(strategyGroups[strategy]);
+        const strategyPnL = calculatePnLSum(strategyItems);
+        const wrapperStyle = nested ? styles.subgroupWrapper : styles.sourceWrapper;
+        const headerStyle = nested ? styles.subgroupCollapseHeader : styles.sourceCollapseHeader;
+        const titleStyle = nested ? styles.subgroupCollapseTitle : styles.sourceCollapseTitle;
+        const contentStyle = nested ? styles.subgroupCollapseContent : styles.sourceCollapseContent;
+
+        return (
+          <View key={strategy} style={wrapperStyle}>
+            <TouchableOpacity
+              style={headerStyle}
+              onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [strategyKey]: !prev[strategyKey] }))}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                <Text style={{ fontSize: nested ? 9 : 11, color: nested ? '#6b7280' : '#9ca3af', marginRight: 6 }}>
+                  {isStrategyCollapsed ? '>' : 'v'}
+                </Text>
+                <Text style={titleStyle} numberOfLines={1}>{strategy}</Text>
+              </View>
+              {renderHistoryPnL(strategyPnL)}
+            </TouchableOpacity>
+
+            {!isStrategyCollapsed && (
+              <View style={contentStyle}>
+                {renderDateGroups(strategyGroups[strategy], strategyKey)}
+              </View>
+            )}
+          </View>
+        );
+      })
+    );
+
+    const renderIndexOptionGroups = (assetGroups, categoryKey) => (
+      getSortedKeys(assetGroups, INDEX_OPTION_ASSET_ORDER).map(asset => {
+        const assetKey = `${categoryKey}_asset_${asset}`;
+        const isAssetCollapsed = !!collapsedSubgroups[assetKey];
+        const assetItems = getHistoryItems(assetGroups[asset]);
+        const assetPnL = calculatePnLSum(assetItems);
+
+        return (
+          <View key={asset} style={styles.sourceWrapper}>
+            <TouchableOpacity
+              style={styles.sourceCollapseHeader}
+              onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [assetKey]: !prev[assetKey] }))}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                <Text style={{ fontSize: 11, color: '#9ca3af', marginRight: 6 }}>
+                  {isAssetCollapsed ? '>' : 'v'}
+                </Text>
+                <Text style={styles.sourceCollapseTitle} numberOfLines={1}>{asset}</Text>
+              </View>
+              {renderHistoryPnL(assetPnL)}
+            </TouchableOpacity>
+
+            {!isAssetCollapsed && (
+              <View style={styles.sourceCollapseContent}>
+                {getSortedKeys(assetGroups[asset], TRADE_TYPE_ORDER).map(tradeType => {
+                  const tradeTypeKey = `${assetKey}_type_${tradeType}`;
+                  const isTradeTypeCollapsed = !!collapsedSubgroups[tradeTypeKey];
+                  const tradeTypeItems = getHistoryItems(assetGroups[asset][tradeType]);
+                  const tradeTypePnL = calculatePnLSum(tradeTypeItems);
+
+                  return (
+                    <View key={tradeType} style={styles.subgroupWrapper}>
+                      <TouchableOpacity
+                        style={styles.subgroupCollapseHeader}
+                        onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [tradeTypeKey]: !prev[tradeTypeKey] }))}
+                      >
+                        <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
+                          <Text style={{ fontSize: 9, color: '#6b7280', marginRight: 6 }}>
+                            {isTradeTypeCollapsed ? '>' : 'v'}
+                          </Text>
+                          <Text style={styles.subgroupCollapseTitle} numberOfLines={1}>{tradeType}</Text>
+                        </View>
+                        {renderHistoryPnL(tradeTypePnL)}
+                      </TouchableOpacity>
+
+                      {!isTradeTypeCollapsed && (
+                        <View style={styles.subgroupCollapseContent}>
+                          {renderStrategyGroups(assetGroups[asset][tradeType], tradeTypeKey, true)}
+                        </View>
+                      )}
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+          </View>
+        );
+      })
+    );
+
     return sortedCategories.map(category => {
       const categoryMeta = REPORT_CATEGORY_OPTIONS.find(item => item.label === category) || REPORT_CATEGORY_BY_ID.OTHER;
       const categoryKey = `history_${category}`;
@@ -864,63 +1028,9 @@ export default function PaperTradeScreen({ session, purgeTrigger }) {
 
           {!isCategoryCollapsed && (
             <View style={styles.dateContent}>
-              {getSortedKeys(groupedHistory[category]).map(strategy => {
-                const strategyKey = `history_${category}_${strategy}`;
-                const isStrategyCollapsed = !!collapsedSubgroups[strategyKey];
-                const strategyItems = getHistoryItems(groupedHistory[category][strategy]);
-                const strategyPnL = calculatePnLSum(strategyItems);
-
-                return (
-                  <View key={strategy} style={styles.sourceWrapper}>
-                    <TouchableOpacity
-                      style={styles.sourceCollapseHeader}
-                      onPress={() => setCollapsedSubgroups(prev => ({ ...prev, [strategyKey]: !prev[strategyKey] }))}
-                    >
-                      <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
-                        <Text style={{ fontSize: 11, color: '#9ca3af', marginRight: 6 }}>
-                          {isStrategyCollapsed ? '>' : 'v'}
-                        </Text>
-                        <Text style={styles.sourceCollapseTitle} numberOfLines={1}>{strategy}</Text>
-                      </View>
-                      {renderHistoryPnL(strategyPnL)}
-                    </TouchableOpacity>
-
-                    {!isStrategyCollapsed && (
-                      <View style={styles.sourceCollapseContent}>
-                        {getSortedKeys(groupedHistory[category][strategy]).sort((a, b) => b.localeCompare(a)).map(dateKey => {
-                          const dateCollapseKey = `history_${category}_${strategy}_${dateKey}`;
-                          const isDateCollapsed = !!collapsedDates[dateCollapseKey];
-                          const dateItems = groupedHistory[category][strategy][dateKey];
-                          const datePnL = calculatePnLSum(dateItems);
-
-                          return (
-                            <View key={dateKey} style={styles.subgroupWrapper}>
-                              <TouchableOpacity
-                                style={styles.subgroupCollapseHeader}
-                                onPress={() => setCollapsedDates(prev => ({ ...prev, [dateCollapseKey]: !prev[dateCollapseKey] }))}
-                              >
-                                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, minWidth: 0 }}>
-                                  <Text style={{ fontSize: 9, color: '#6b7280', marginRight: 6 }}>
-                                    {isDateCollapsed ? '>' : 'v'}
-                                  </Text>
-                                  <Text style={styles.subgroupCollapseTitle} numberOfLines={1}>{formatDateKey(dateKey)}</Text>
-                                </View>
-                                {renderHistoryPnL(datePnL)}
-                              </TouchableOpacity>
-
-                              {!isDateCollapsed && includePositionCards && (
-                                <View style={styles.subgroupCollapseContent}>
-                                  {dateItems.map(item => renderPositionCard(item))}
-                                </View>
-                              )}
-                            </View>
-                          );
-                        })}
-                      </View>
-                    )}
-                  </View>
-                );
-              })}
+              {category === 'Index Options'
+                ? renderIndexOptionGroups(groupedHistory[category], categoryKey)
+                : renderStrategyGroups(groupedHistory[category], categoryKey)}
             </View>
           )}
         </View>
